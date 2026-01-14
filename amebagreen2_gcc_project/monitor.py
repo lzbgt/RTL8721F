@@ -87,7 +87,7 @@ def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Serial Monitor (Real-time Sending, No Local Echo)')
     parser.add_argument('-p', '--port', help='Serial port name, e.g., COM3 (Windows) or /dev/ttyUSB0 (Linux)')
-    parser.add_argument('-b', '--baudrate', type=int, help='Serial baud rate, e.g., 9600, 115200')
+    parser.add_argument('-b', '--baudrate', type=int, default=1500000, help='Serial baud rate, e.g., 9600, 115200 (default: 1500000)')
     parser.add_argument(
         '--pre-reset',
         choices=['none', 'dtr', 'rts', 'both', 'dtr-inv', 'rts-inv', 'both-inv', 'auto'],
@@ -95,9 +95,14 @@ def main():
         help='Optional: pulse UART DTR/RTS before attaching (best-effort). Default is none.',
     )
     parser.add_argument(
+        '--reset',
+        action='store_true',
+        help='Send the soft reset ("reboot") command before monitoring.',
+    )
+    parser.add_argument(
         '--no-reset',
         action='store_true',
-        help='Do not send the soft reset ("reboot") command before monitoring.',
+        help='Do not send the soft reset ("reboot") command before monitoring (default).',
     )
     parser.add_argument('-debug', action='store_true', 
                        help='Enable debug mode: Display raw hexadecimal data of sent and received bytes')
@@ -130,6 +135,8 @@ def main():
 
     if not port:
         raise ValueError("Serial port is invalid")
+    if baudrate is None:
+        raise ValueError("Serial baudrate is invalid")
 
     # Optional: hardware-line reset pulse. This cannot override a physical BOOT/download strap.
     try:
@@ -147,8 +154,10 @@ def main():
     cmds.append("--timestamps")
     cmds.append("--target-os")
     cmds.append("freertos")
-    # Default behavior: do a soft reset so the monitor starts from clean boot logs.
-    if not args.no_reset:
+    # Default behavior: do NOT reset (avoid accidentally latching ROM download mode on some boards).
+    if args.reset and args.no_reset:
+        raise ValueError("Use at most one of --reset or --no-reset")
+    if args.reset:
         cmds.append("--reset")
     if debug:
         cmds.append("--debug")

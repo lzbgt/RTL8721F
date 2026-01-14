@@ -8,7 +8,26 @@ import glob
 import subprocess
 
 # CMAKE_GDB IS AUTOSET BY CMAKE, DO NOT CHANGE IT MANUALLY.
-CMAKE_GDB = '/opt/rtk-toolchain/asdk-12.3.1-4568/linux/newlib/bin/arm-none-eabi-gdb'
+def _find_gdb():
+    env_gdb = os.environ.get('CMAKE_GDB') or os.environ.get('RTK_GDB')
+    if env_gdb and os.path.exists(env_gdb):
+        return env_gdb
+
+    if sys.platform.startswith('win'):
+        toolchain_root = os.environ.get('RTK_TOOLCHAIN', 'C:/rtk-toolchain')
+        matches = glob.glob(os.path.join(toolchain_root, '*', 'mingw32', 'newlib', 'bin', 'arm-none-eabi-gdb.exe'))
+        if matches:
+            return matches[0]
+        return 'arm-none-eabi-gdb.exe'
+    else:
+        toolchain_root = os.environ.get('RTK_TOOLCHAIN', '/opt/rtk-toolchain')
+        matches = glob.glob(os.path.join(toolchain_root, '*', 'linux', 'newlib', 'bin', 'arm-none-eabi-gdb'))
+        if matches:
+            return matches[0]
+        return 'arm-none-eabi-gdb'
+
+
+CMAKE_GDB = _find_gdb()
 PROJECT_DIR = os.getcwd()
 ASDK = os.path.join(PROJECT_DIR, 'project_km4tz/asdk')
 GNU_SCRIPT =  os.path.join(ASDK, 'gnu_utility/gnu_script')
