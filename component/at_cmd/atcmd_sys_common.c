@@ -13,6 +13,9 @@
 #include "stdlib.h"
 //#include "FreeRTOS.h"
 #include "os_wrapper_specific.h"
+#if (defined(CONFIG_WHC_HOST) || defined(CONFIG_WHC_NONE))
+#include "kv.h"
+#endif
 #ifdef CONFIG_LWIP_LAYER
 #include "lwip_netconf.h"
 #endif
@@ -670,6 +673,66 @@ static void print_mac_line(const char *label, const u8 mac[6])
 	at_printf("%s => %02x:%02x:%02x:%02x:%02x:%02x\r\n", label, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
+#if (defined(CONFIG_WHC_HOST) || defined(CONFIG_WHC_NONE))
+static int mac_bin_is_valid(const u8 mac[6])
+{
+	if (mac == NULL) {
+		return 0;
+	}
+	/* Reject multicast and all-zero/all-FF. */
+	if ((mac[0] & 0x01) != 0) {
+		return 0;
+	}
+	if (!memcmp(mac, "\x00\x00\x00\x00\x00\x00", 6)) {
+		return 0;
+	}
+	if (!memcmp(mac, "\xff\xff\xff\xff\xff\xff", 6)) {
+		return 0;
+	}
+	return 1;
+}
+
+static void apply_kv_macs_best_effort(void)
+{
+	const char *KEY_STA = "mac_sta";
+	const char *KEY_AP = "mac_ap";
+	const char *KEY_ETH = "mac_eth";
+	u8 mac[6] = {0};
+
+#ifdef CONFIG_LWIP_LAYER
+#ifdef CONFIG_WLAN
+	if (rt_kv_get(KEY_STA, mac, 6) == 6 && mac_bin_is_valid(mac)) {
+		(void)wifi_set_mac_address(0, mac, 0);
+		u8 *hw = LwIP_GetMAC(NETIF_WLAN_STA_INDEX);
+		if (hw) {
+			memcpy((void *)hw, (const void *)mac, 6);
+		}
+	}
+	if (rt_kv_get(KEY_AP, mac, 6) == 6 && mac_bin_is_valid(mac)) {
+		(void)wifi_set_mac_address(1, mac, 0);
+		u8 *hw = LwIP_GetMAC(NETIF_WLAN_AP_INDEX);
+		if (hw) {
+			memcpy((void *)hw, (const void *)mac, 6);
+		}
+	}
+#endif
+#if defined(CONFIG_ETHERNET) || defined(CONFIG_LWIP_USB_ETHERNET)
+	if (rt_kv_get(KEY_ETH, mac, 6) == 6 && mac_bin_is_valid(mac)) {
+		Ethernet_SetMacAddr(mac);
+		u8 *hw = LwIP_GetMAC(NETIF_ETH_INDEX);
+		if (hw) {
+			memcpy((void *)hw, (const void *)mac, 6);
+		}
+	}
+#endif
+#endif /* CONFIG_LWIP_LAYER */
+}
+#else
+static void apply_kv_macs_best_effort(void)
+{
+}
+#endif
+
 /****************************************************************
 AT command process:
 	AT+MAC
@@ -690,8 +753,16 @@ void at_mac(void *arg)
 	int argc = 0;
 	char *argv[MAX_ARGC] = {0};
 
+	/* KV keys for persistence */
+	const char *KEY_STA = "mac_sta";
+	const char *KEY_AP = "mac_ap";
+	const char *KEY_ETH = "mac_eth";
+
 	/* No args: just print current MACs (best-effort). */
 	if (arg == NULL) {
+		/* If the user previously persisted MACs to KV, apply them now so the runtime
+		 * state reflects the stored values after reboot. */
+		apply_kv_macs_best_effort();
 #ifdef CONFIG_LWIP_LAYER
 #ifdef CONFIG_WLAN
 		u8 *sta_mac = LwIP_GetMAC(NETIF_WLAN_STA_INDEX);
@@ -706,28 +777,118 @@ void at_mac(void *arg)
 		}
 #endif
 #endif /* CONFIG_LWIP_LAYER */
+#if (defined(CONFIG_WHC_HOST) || defined(CONFIG_WHC_NONE))
+		/* Also show persisted values (KV), if any. */
+		{
+			u8 kv_mac[6] = {0};
+			if (rt_kv_get(KEY_STA, kv_mac, 6) == 6) {
+				print_mac_line("STA MAC (KV)", kv_mac);
+			}
+			if (rt_kv_get(KEY_AP, kv_mac, 6) == 6) {
+				print_mac_line("AP  MAC (KV)", kv_mac);
+			}
+			if (rt_kv_get(KEY_ETH, kv_mac, 6) == 6) {
+				print_mac_line("ETH MAC (KV)", kv_mac);
+			}
+		}
+#endif
 		at_printf(ATCMD_OK_END_STR);
 		return;
 	}
 
 	argc = parse_param(arg, argv);
-	if (argc < 3 || argv[1] == NULL || argv[2] == NULL) {
+	/* Accept both:
+	 *  - AT+MAC=STA,<mac>[,<store_flag>]
+	 *  - AT+MAC=<store_flag>,STA[,<mac>]
+	 * where <store_flag>: 0=RAM only, 1=save KV (default), 2=erase KV.
+	 */
+	if (argc < 2 || argv[1] == NULL) {
 		at_printf("\r\nUsage:\r\n");
 		at_printf("AT+MAC\r\n");
-		at_printf("AT+MAC=<STA|AP|ETH>,<aa:bb:cc:dd:ee:ff>\r\n");
+		at_printf("AT+MAC=<STA|AP|ETH>,<aa:bb:cc:dd:ee:ff>[,<store_flag>]\r\n");
+		at_printf("AT+MAC=<store_flag>,<STA|AP|ETH>[,<aa:bb:cc:dd:ee:ff>]\r\n");
+		at_printf("\t<store_flag>: 0=RAM only, 1=save to KV (default), 2=erase KV\r\n");
 		at_printf(ATCMD_ERROR_END_STR, 1);
 		return;
 	}
 
-	if (parse_mac_str(argv[2], mac) != 0) {
+	/* Parse forms */
+#if (defined(CONFIG_WHC_HOST) || defined(CONFIG_WHC_NONE))
+	int store_flag = 1; /* default persist */
+#else
+	int store_flag = 0; /* RAM-only (KV not available) */
+#endif
+	const char *if_name = NULL;
+	const char *mac_str = NULL;
+
+	if (argv[1] && (strlen(argv[1]) == 1) && (argv[1][0] >= '0') && (argv[1][0] <= '2')) {
+		store_flag = atoi(argv[1]);
+		if_name = (argc >= 3) ? argv[2] : NULL;
+		mac_str = (argc >= 4) ? argv[3] : NULL;
+	} else {
+		if_name = argv[1];
+		mac_str = (argc >= 3) ? argv[2] : NULL;
+		if (argc >= 4 && argv[3] != NULL) {
+			store_flag = atoi(argv[3]);
+		}
+	}
+
+	if (store_flag < 0 || store_flag > 2 || if_name == NULL) {
+		at_printf(ATCMD_ERROR_END_STR, 1);
+		return;
+	}
+
+	const char *kv_key = NULL;
+#ifdef CONFIG_WLAN
+	if ((strcasecmp(if_name, "STA") == 0) || (strcasecmp(if_name, "0") == 0)) {
+		kv_key = KEY_STA;
+	} else if ((strcasecmp(if_name, "AP") == 0) || (strcasecmp(if_name, "1") == 0)) {
+		kv_key = KEY_AP;
+	}
+#endif
+#if defined(CONFIG_ETHERNET) || defined(CONFIG_LWIP_USB_ETHERNET)
+	if (strcasecmp(if_name, "ETH") == 0) {
+		kv_key = KEY_ETH;
+	}
+#endif
+	if (kv_key == NULL) {
+		at_printf("\r\nUnknown interface. Use STA/AP/ETH.\r\n");
+		at_printf(ATCMD_ERROR_END_STR, 4);
+		return;
+	}
+
+	if (store_flag == 2) {
+#if (defined(CONFIG_WHC_HOST) || defined(CONFIG_WHC_NONE))
+		rt_kv_delete(kv_key);
+		at_printf(ATCMD_OK_END_STR);
+		return;
+#else
+		at_printf("\r\nKV persistence not available in this build.\r\n");
+		at_printf(ATCMD_ERROR_END_STR, 1);
+		return;
+#endif
+	}
+
+	if (mac_str == NULL || parse_mac_str(mac_str, mac) != 0) {
 		at_printf("\r\nInvalid MAC (must be unicast and non-zero).\r\n");
 		at_printf(ATCMD_ERROR_END_STR, 2);
 		return;
 	}
 
 #ifdef CONFIG_WLAN
-	if ((strcasecmp(argv[1], "STA") == 0) || (strcasecmp(argv[1], "0") == 0)) {
+	if ((strcasecmp(if_name, "STA") == 0) || (strcasecmp(if_name, "0") == 0)) {
 		if (wifi_set_mac_address(0, mac, 0) == RTK_SUCCESS) {
+			if (store_flag == 1) {
+#if (defined(CONFIG_WHC_HOST) || defined(CONFIG_WHC_NONE))
+				rt_kv_set(KEY_STA, mac, 6);
+#endif
+			}
+#ifdef CONFIG_LWIP_LAYER
+			u8 *sta_hwaddr = LwIP_GetMAC(NETIF_WLAN_STA_INDEX);
+			if (sta_hwaddr) {
+				memcpy((void *)sta_hwaddr, (const void *)mac, 6);
+			}
+#endif
 			print_mac_line("STA MAC set", mac);
 			at_printf(ATCMD_OK_END_STR);
 		} else {
@@ -735,8 +896,19 @@ void at_mac(void *arg)
 		}
 		return;
 	}
-	if ((strcasecmp(argv[1], "AP") == 0) || (strcasecmp(argv[1], "1") == 0)) {
+	if ((strcasecmp(if_name, "AP") == 0) || (strcasecmp(if_name, "1") == 0)) {
 		if (wifi_set_mac_address(1, mac, 0) == RTK_SUCCESS) {
+			if (store_flag == 1) {
+#if (defined(CONFIG_WHC_HOST) || defined(CONFIG_WHC_NONE))
+				rt_kv_set(KEY_AP, mac, 6);
+#endif
+			}
+#ifdef CONFIG_LWIP_LAYER
+			u8 *ap_hwaddr = LwIP_GetMAC(NETIF_WLAN_AP_INDEX);
+			if (ap_hwaddr) {
+				memcpy((void *)ap_hwaddr, (const void *)mac, 6);
+			}
+#endif
 			print_mac_line("AP MAC set", mac);
 			at_printf(ATCMD_OK_END_STR);
 		} else {
@@ -747,7 +919,7 @@ void at_mac(void *arg)
 #endif /* CONFIG_WLAN */
 
 #if defined(CONFIG_ETHERNET) || defined(CONFIG_LWIP_USB_ETHERNET)
-	if (strcasecmp(argv[1], "ETH") == 0) {
+	if (strcasecmp(if_name, "ETH") == 0) {
 		Ethernet_SetMacAddr(mac);
 		/* Keep lwIP netif hwaddr in sync (if present). */
 #ifdef CONFIG_LWIP_LAYER
@@ -756,6 +928,11 @@ void at_mac(void *arg)
 			memcpy((void *)eth_hwaddr, (const void *)mac, 6);
 		}
 #endif
+		if (store_flag == 1) {
+#if (defined(CONFIG_WHC_HOST) || defined(CONFIG_WHC_NONE))
+			rt_kv_set(KEY_ETH, mac, 6);
+#endif
+		}
 		print_mac_line("ETH MAC set", mac);
 		at_printf(ATCMD_OK_END_STR);
 		return;

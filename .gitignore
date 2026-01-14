@@ -19,6 +19,9 @@
 /**/__pycache__/
 *.pyc
 
+# AmebaFlash (CLI) local settings
+/tools/ameba/Flash/Settings.json
+
 # all bin files
 *.bin
 *.axf

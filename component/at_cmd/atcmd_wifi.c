@@ -9,11 +9,18 @@
 #ifndef CONFIG_MP_SHRINK
 #include "atcmd_service.h"
 #include "atcmd_wifi.h"
+#if (defined(CONFIG_WHC_HOST) || defined(CONFIG_WHC_NONE))
+#include "kv.h"
+#endif
 #ifdef CONFIG_LWIP_LAYER
 #include "dhcp/dhcps.h"
+#include "lwip_netconf.h"
 #endif
 #ifdef CONFIG_WLAN
 #include "wifi_intf_drv_to_upper.h"
+#endif
+#if defined(CONFIG_LWIP_USB_ETHERNET) || defined(CONFIG_ETHERNET)
+#include "ameba_ethernet.h"
 #endif
 #ifdef CONFIG_WHC_HOST
 #ifdef CONFIG_WHC_INTF_IPC
@@ -35,6 +42,110 @@ static struct rtw_network_info wifi = {0};
 static struct rtw_softap_info ap = {0};
 static unsigned char password[129] = {0};
 static int security = -1;
+
+extern int TRNG_get_random_bytes(void *dst, u32 size);
+
+static int mac_is_invalid(const u8 mac[6])
+{
+	if (mac == NULL) {
+		return 1;
+	}
+	/* Reject multicast, all-zero, and all-FF. */
+	if ((mac[0] & 0x01) != 0) {
+		return 1;
+	}
+	if (!memcmp(mac, "\x00\x00\x00\x00\x00\x00", 6)) {
+		return 1;
+	}
+	if (!memcmp(mac, "\xff\xff\xff\xff\xff\xff", 6)) {
+		return 1;
+	}
+	return 0;
+}
+
+static void mac_make_laa_unicast(u8 mac[6])
+{
+	/* Set "locally administered" (bit 1) and clear multicast (bit 0). */
+	mac[0] = (mac[0] & 0xFE) | 0x02;
+}
+
+static void mac_generate_random_laa(u8 mac[6])
+{
+	u8 buf[6] = {0};
+	(void)TRNG_get_random_bytes(buf, 6);
+	memcpy(mac, buf, 6);
+	mac_make_laa_unicast(mac);
+	if (mac_is_invalid(mac)) {
+		/* Ensure non-zero even if RNG fails. */
+		memcpy(mac, "\x02\x11\x22\x33\x44\x55", 6);
+	}
+}
+
+static void apply_persisted_macs_best_effort(void)
+{
+#if !(defined(CONFIG_WHC_HOST) || defined(CONFIG_WHC_NONE))
+	return;
+#else
+	const char *KEY_STA = "mac_sta";
+	const char *KEY_AP = "mac_ap";
+	u8 mac[6] = {0};
+
+#ifdef CONFIG_LWIP_LAYER
+	/* STA */
+	if (rt_kv_get(KEY_STA, mac, 6) == 6 && !mac_is_invalid(mac)) {
+		(void)wifi_set_mac_address(0, mac, 0);
+		u8 *hw = LwIP_GetMAC(NETIF_WLAN_STA_INDEX);
+		if (hw) {
+			memcpy((void *)hw, mac, 6);
+		}
+	} else {
+		u8 *hw = LwIP_GetMAC(NETIF_WLAN_STA_INDEX);
+		if (hw && mac_is_invalid(hw)) {
+			mac_generate_random_laa(mac);
+			(void)rt_kv_set(KEY_STA, mac, 6);
+			(void)wifi_set_mac_address(0, mac, 0);
+			memcpy((void *)hw, mac, 6);
+		}
+	}
+
+	/* AP */
+	if (rt_kv_get(KEY_AP, mac, 6) == 6 && !mac_is_invalid(mac)) {
+		(void)wifi_set_mac_address(1, mac, 0);
+		u8 *hw = LwIP_GetMAC(NETIF_WLAN_AP_INDEX);
+		if (hw) {
+			memcpy((void *)hw, mac, 6);
+		}
+	}
+
+#if defined(CONFIG_LWIP_USB_ETHERNET) || defined(CONFIG_ETHERNET)
+	/* Ethernet */
+	const char *KEY_ETH = "mac_eth";
+	u8 *eth_hw = LwIP_GetMAC(NETIF_ETH_INDEX);
+	if (rt_kv_get(KEY_ETH, mac, 6) == 6 && !mac_is_invalid(mac)) {
+		Ethernet_SetMacAddr(mac);
+		if (eth_hw) {
+			memcpy((void *)eth_hw, mac, 6);
+		}
+	} else if (eth_hw && mac_is_invalid(eth_hw)) {
+		/* No stored ETH MAC yet; derive from STA if possible, otherwise generate. */
+		u8 *sta_hw = LwIP_GetMAC(NETIF_WLAN_STA_INDEX);
+		if (sta_hw && !mac_is_invalid(sta_hw)) {
+			memcpy(mac, sta_hw, 6);
+			mac[5] += 3;
+			if (mac_is_invalid(mac)) {
+				mac_generate_random_laa(mac);
+			}
+		} else {
+			mac_generate_random_laa(mac);
+		}
+		(void)rt_kv_set(KEY_ETH, mac, 6);
+		Ethernet_SetMacAddr(mac);
+		memcpy((void *)eth_hw, mac, 6);
+	}
+#endif
+#endif /* CONFIG_LWIP_LAYER */
+#endif
+}
 
 #if defined(CONFIG_IP_NAT) && (CONFIG_IP_NAT == 1)
 extern void ipnat_dump(void);
@@ -334,6 +445,8 @@ void at_wlconn(void *arg)
 	if ((wifi.key_id >= 0) && (wifi.key_id <= 3) && (wifi.password != NULL)) {
 		wifi.security_type = RTW_SECURITY_WEP_SHARED;
 	}
+
+	apply_persisted_macs_best_effort();
 
 	/* Connecting ...... */
 	ret = wifi_connect(&wifi, 1);
@@ -883,6 +996,8 @@ void at_wlstartap(void *arg)
 		goto end;
 	}
 
+	apply_persisted_macs_best_effort();
+
 #ifdef CONFIG_LWIP_LAYER
 	dhcps_deinit();
 	ip_addr = CONCAT_TO_UINT32(GW_ADDR0, GW_ADDR1, GW_ADDR2, GW_ADDR3);
@@ -998,8 +1113,17 @@ void at_wlstate(void *arg)
 		return;
 	}
 
+	apply_persisted_macs_best_effort();
+
 	RTK_LOGI(NOTAG, "[+WLSTATE]: _AT_WLAN_INFO_\r\n");
 	for (i = 0; i < NET_IF_NUM; i++) {
+#if (defined(CONFIG_LWIP_USB_ETHERNET) || defined(CONFIG_ETHERNET))
+		/* On this platform, NETIF_ETH_INDEX is part of NET_IF_NUM but it isn't a WLAN interface.
+		 * Skip it here and print it in the dedicated ethernet section below. */
+		if (i == NETIF_ETH_INDEX) {
+			continue;
+		}
+#endif
 		if (wifi_is_running(i)) {
 #ifdef CONFIG_LWIP_LAYER
 			mac = LwIP_GetMAC(i);
@@ -1054,16 +1178,29 @@ void at_wlstate(void *arg)
 	/* show the ethernet interface info */
 #if (defined(CONFIG_LWIP_USB_ETHERNET) || defined(CONFIG_ETHERNET))
 #ifdef CONFIG_LWIP_LAYER
-	mac = (uint8_t *)(pnetif_eth->hwaddr);
-	ip = (uint8_t *) & (pnetif_eth->ip_addr);
-	gw = (uint8_t *) & (pnetif_eth->gw);
-	msk = (uint8_t *) & (pnetif_eth->netmask);
 	at_printf("Interface ethernet\r\n");
 	at_printf("==============================\r\n");
-	at_printf("MAC => %02x:%02x:%02x:%02x:%02x:%02x\r\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]) ;
-	at_printf("IP  => %d.%d.%d.%d\r\n", ip[0], ip[1], ip[2], ip[3]);
-	at_printf("GW  => %d.%d.%d.%d\r\n", gw[0], gw[1], gw[2], gw[3]);
-	at_printf("MSK  => %d.%d.%d.%d\r\n\r\n", msk[0], msk[1], msk[2], msk[3]);
+	if (pnetif_eth == NULL) {
+		at_printf("Status: not initialized\r\n\r\n");
+	} else {
+		/* Use the same accessor helpers as WLAN, to avoid endianness/struct layout pitfalls. */
+		mac = LwIP_GetMAC(NETIF_ETH_INDEX);
+		ip = LwIP_GetIP(NETIF_ETH_INDEX);
+		gw = LwIP_GetGW(NETIF_ETH_INDEX);
+		msk = LwIP_GetMASK(NETIF_ETH_INDEX);
+		if (mac == NULL || ip == NULL || gw == NULL || msk == NULL) {
+			at_printf("Status: not initialized\r\n\r\n");
+			goto eth_done;
+		}
+		at_printf("MAC => %02x:%02x:%02x:%02x:%02x:%02x\r\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]) ;
+		if (mac[0] == 0 && mac[1] == 0 && mac[2] == 0 && mac[3] == 0 && mac[4] == 0 && mac[5] == 0) {
+			at_printf("NOTE: Ethernet MAC is all-zero; set a runtime MAC via AT+MAC=ETH,<aa:bb:cc:dd:ee:ff>\r\n");
+		}
+		at_printf("IP  => %d.%d.%d.%d\r\n", ip[0], ip[1], ip[2], ip[3]);
+		at_printf("GW  => %d.%d.%d.%d\r\n", gw[0], gw[1], gw[2], gw[3]);
+		at_printf("MSK  => %d.%d.%d.%d\r\n\r\n", msk[0], msk[1], msk[2], msk[3]);
+	}
+eth_done:
 #endif /* CONFIG_LWIP_LAYER */
 #endif /* CONFIG_LWIP_USB_ETHERNET || CONFIG_ETHERNET */
 	rtos_mem_free((void *)p_wifi_setting);

@@ -8,6 +8,8 @@ import argparse
 import os
 import shutil
 import sys
+import glob
+import subprocess
 
 DEFAULT_BUILD_DIR = 'build'
 
@@ -16,6 +18,19 @@ project_dir = os.path.dirname(os.path.abspath(__file__))
 gdb_script_dir = os.path.join(project_dir, 'utils/jlink_script/gdb.py')
 
 copy_script_dir = os.path.join(project_dir, '../tools/scripts/build_copy.py')
+
+
+def _find_example_prj_conf(app: str) -> str | None:
+    """
+    Best-effort: locate an example's prj.conf under component/example/**/<app>/prj.conf.
+    Returns absolute path if a single match is found.
+    """
+    base = os.path.abspath(os.path.join(project_dir, '..', 'component', 'example'))
+    pattern = os.path.join(base, '**', app, 'prj.conf')
+    matches = glob.glob(pattern, recursive=True)
+    if len(matches) == 1:
+        return os.path.abspath(matches[0])
+    return None
 
 
 def main(argc, argv):
@@ -89,11 +104,21 @@ def main(argc, argv):
     cmd += ' -G Ninja'
 
     if app != None:  # app maybe in submodule directory, get submodule info first
+        # If this is a known SDK example, automatically apply its prj.conf (Kconfig)
+        # so the build actually enables required features (e.g. Ethernet RMII + NAT).
+        prj_conf = _find_example_prj_conf(app)
+        if prj_conf:
+            menuconfig_py = os.path.join(project_dir, 'menuconfig.py')
+            print(f'Applying prj.conf: {prj_conf}')
+            try:
+                subprocess.run([sys.executable, menuconfig_py, '-f', prj_conf], cwd=project_dir, check=True)
+            except Exception:
+                print('\033[31mError: Fail to apply prj.conf via menuconfig.py\033[0m')
+                sys.exit(1)
+
         cmd_pre = cmd + ' && ninja gen_submodule_info'
         print(cmd_pre)
         os.system(cmd_pre)
-        if args.pristine:
-            shutil.rmtree(menuconfig_dir)
         cmd += ' -DEXAMPLE=' + app
 
     if args.new:
