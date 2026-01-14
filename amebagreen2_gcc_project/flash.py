@@ -10,6 +10,7 @@ import argparse
 import base64
 import json
 import subprocess
+import time
 
 PROJECT_ROOT_DIR = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
 PROFILE_NOR = os.path.realpath(os.path.join(PROJECT_ROOT_DIR, "../tools/ameba/Flash/Devices/Profiles/AmebaGreen2_FreeRTOS_NOR.rdev"))
@@ -30,10 +31,62 @@ class MemoryInfo:
 def run_flash(argv):
     cmds = [sys.executable, FLASH_TOOL] + argv
     result = subprocess.run(cmds)
-    if result.returncode != 0:
-        sys.exit(1)
-    else:
-        sys.exit(0)
+    return result.returncode
+
+
+def _post_reset(port: str, mode: str, inverted: bool = False) -> None:
+    if mode == "none":
+        return
+    try:
+        import serial  # type: ignore
+    except Exception:
+        # Best-effort: flashing still succeeded; user may reset manually.
+        return
+
+    use_dtr = mode in ("dtr", "both")
+    use_rts = mode in ("rts", "both")
+
+    # Some USB-UART adapters invert the physical reset/boot wiring.
+    seq = [True, False, True] if inverted else [False, True, False]
+
+    ser = serial.Serial(port, baudrate=115200, timeout=0.2)
+    try:
+        # Put lines into a known state then pulse.
+        if use_dtr:
+            ser.dtr = False
+        if use_rts:
+            ser.rts = False
+        time.sleep(0.05)
+
+        for level in seq:
+            if use_dtr:
+                ser.dtr = level
+            if use_rts:
+                ser.rts = level
+            time.sleep(0.05)
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+
+def post_reset(port: str, mode: str) -> None:
+    """
+    Try to reset the board via UART control lines.
+
+    Note: This cannot override a physical BOOT/download-mode strap/button.
+    """
+    if mode == "auto":
+        _post_reset(port, "both", inverted=False)
+        time.sleep(0.2)
+        _post_reset(port, "both", inverted=True)
+        return
+    if mode.endswith("-inv"):
+        base = mode[:-4]
+        _post_reset(port, base, inverted=True)
+        return
+    _post_reset(port, mode, inverted=False)
 
 
 def main():
@@ -52,6 +105,12 @@ def main():
     parser.add_argument('--chip-erase', action='store_true', help='chip erase')
     parser.add_argument('--log-level', default='info', help='log level')
     parser.add_argument('--no-reset', action='store_true', help='do not reset after flashing finished')
+    parser.add_argument(
+        '--post-reset',
+        choices=['none', 'dtr', 'rts', 'both', 'dtr-inv', 'rts-inv', 'both-inv', 'auto'],
+        default='auto',
+        help='After flashing succeeds, pulse UART DTR/RTS to reset the board (best-effort).',
+    )
 
     args = parser.parse_args()
     ports = args.port
@@ -156,7 +215,20 @@ def main():
         cmds.append(f"--partition-table")
         cmds.append(f"{partition_table_base64}")
 
-    run_flash(cmds)
+    rc = run_flash(cmds)
+    if rc != 0:
+        sys.exit(1)
+
+    # Realtek flasher can issue a reset, but many boards remain in ROM download mode
+    # unless a physical button/strap is released. Still, default to a best-effort
+    # DTR/RTS pulse so the common workflow "flash -> run" needs fewer manual steps.
+    if (not args.no_reset) and ports and args.post_reset != "none":
+        try:
+            post_reset(ports[0], args.post_reset)
+        except Exception:
+            pass
+
+    sys.exit(0)
 
 
 if __name__ == "__main__":

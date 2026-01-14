@@ -10,6 +10,51 @@ import subprocess
 PROJECT_ROOT_DIR = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
 MONITOR_TOOL = os.path.realpath(os.path.join(PROJECT_ROOT_DIR, "../tools/ameba/Monitor/monitor.py"))
 
+def _pulse_port(port: str, mode: str, inverted: bool = False) -> None:
+    if mode == "none":
+        return
+    try:
+        import serial  # type: ignore
+    except Exception:
+        return
+
+    use_dtr = mode in ("dtr", "both")
+    use_rts = mode in ("rts", "both")
+    seq = [True, False, True] if inverted else [False, True, False]
+
+    ser = serial.Serial(port, baudrate=115200, timeout=0.2)
+    try:
+        if use_dtr:
+            ser.dtr = False
+        if use_rts:
+            ser.rts = False
+        time.sleep(0.05)
+
+        for level in seq:
+            if use_dtr:
+                ser.dtr = level
+            if use_rts:
+                ser.rts = level
+            time.sleep(0.05)
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+
+def pre_reset(port: str, mode: str) -> None:
+    if mode == "auto":
+        _pulse_port(port, "both", inverted=False)
+        time.sleep(0.2)
+        _pulse_port(port, "both", inverted=True)
+        return
+    if mode.endswith("-inv"):
+        base = mode[:-4]
+        _pulse_port(port, base, inverted=True)
+        return
+    _pulse_port(port, mode, inverted=False)
+
 def run_monitor(argv):
     cmds = [sys.executable, MONITOR_TOOL] + argv
     p = None
@@ -43,6 +88,12 @@ def main():
     parser = argparse.ArgumentParser(description='Serial Monitor (Real-time Sending, No Local Echo)')
     parser.add_argument('-p', '--port', help='Serial port name, e.g., COM3 (Windows) or /dev/ttyUSB0 (Linux)')
     parser.add_argument('-b', '--baudrate', type=int, help='Serial baud rate, e.g., 9600, 115200')
+    parser.add_argument(
+        '--pre-reset',
+        choices=['none', 'dtr', 'rts', 'both', 'dtr-inv', 'rts-inv', 'both-inv', 'auto'],
+        default='auto',
+        help='Pulse UART DTR/RTS before attaching to the serial monitor (best-effort).',
+    )
     parser.add_argument('-reset', action='store_true', 
                        help='Enable reset mode: Wait 100ms after connection to send "reboot" command, start output only after detecting "ROM:["')
     parser.add_argument('-debug', action='store_true', 
@@ -77,6 +128,13 @@ def main():
 
     if not port:
         raise ValueError("Serial port is invalid")
+
+    # Default behavior: try to reset once so the monitor usually starts at boot logs.
+    # This cannot override a physical BOOT/download-mode strap/button.
+    try:
+        pre_reset(port, args.pre_reset)
+    except Exception:
+        pass
 
     cmds = []
     cmds.append("--device")
