@@ -13,6 +13,15 @@
 #include "stdlib.h"
 //#include "FreeRTOS.h"
 #include "os_wrapper_specific.h"
+#ifdef CONFIG_LWIP_LAYER
+#include "lwip_netconf.h"
+#endif
+#ifdef CONFIG_WLAN
+#include "wifi_intf_drv_to_app_internal.h"
+#endif
+#if defined(CONFIG_ETHERNET) || defined(CONFIG_LWIP_USB_ETHERNET)
+#include "ameba_ethernet.h"
+#endif
 #if (configGENERATE_RUN_TIME_STATS == 1)
 #include "task.h"
 #endif
@@ -619,6 +628,144 @@ void at_state(void *arg)
 	at_printf(ATCMD_OK_END_STR);
 }
 
+static int parse_mac_str(const char *s, u8 mac[6])
+{
+	unsigned int b[6];
+	char tmp[32] = {0};
+	size_t i;
+
+	if (s == NULL) {
+		return -1;
+	}
+
+	/* Accept both "aa:bb:.." and "aa-bb-.." */
+	strncpy(tmp, s, sizeof(tmp) - 1);
+	for (i = 0; tmp[i] != '\0'; i++) {
+		if (tmp[i] == '-') {
+			tmp[i] = ':';
+		}
+	}
+
+	if (sscanf(tmp, "%2x:%2x:%2x:%2x:%2x:%2x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) {
+		return -1;
+	}
+
+	for (i = 0; i < 6; i++) {
+		mac[i] = (u8)(b[i] & 0xFF);
+	}
+
+	/* Reject multicast and all-zero. */
+	if ((mac[0] & 0x01) != 0) {
+		return -1;
+	}
+	if (mac[0] == 0 && mac[1] == 0 && mac[2] == 0 && mac[3] == 0 && mac[4] == 0 && mac[5] == 0) {
+		return -1;
+	}
+
+	return 0;
+}
+
+static void print_mac_line(const char *label, const u8 mac[6])
+{
+	at_printf("%s => %02x:%02x:%02x:%02x:%02x:%02x\r\n", label, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+/****************************************************************
+AT command process:
+	AT+MAC
+	AT+MAC=<if>,<mac>
+
+Common AT Command:
+	Show/set MAC addresses at runtime.
+
+Examples:
+	AT+MAC
+	AT+MAC=STA,02:11:22:33:44:55
+	AT+MAC=AP,02:11:22:33:44:56
+	AT+MAC=ETH,02:11:22:33:44:57
+****************************************************************/
+void at_mac(void *arg)
+{
+	u8 mac[6] = {0};
+	int argc = 0;
+	char *argv[MAX_ARGC] = {0};
+
+	/* No args: just print current MACs (best-effort). */
+	if (arg == NULL) {
+#ifdef CONFIG_LWIP_LAYER
+#ifdef CONFIG_WLAN
+		u8 *sta_mac = LwIP_GetMAC(NETIF_WLAN_STA_INDEX);
+		if (sta_mac) {
+			print_mac_line("STA MAC", sta_mac);
+		}
+#endif
+#if defined(CONFIG_ETHERNET) || defined(CONFIG_LWIP_USB_ETHERNET)
+		u8 *eth_mac = LwIP_GetMAC(NETIF_ETH_INDEX);
+		if (eth_mac) {
+			print_mac_line("ETH MAC", eth_mac);
+		}
+#endif
+#endif /* CONFIG_LWIP_LAYER */
+		at_printf(ATCMD_OK_END_STR);
+		return;
+	}
+
+	argc = parse_param(arg, argv);
+	if (argc < 3 || argv[1] == NULL || argv[2] == NULL) {
+		at_printf("\r\nUsage:\r\n");
+		at_printf("AT+MAC\r\n");
+		at_printf("AT+MAC=<STA|AP|ETH>,<aa:bb:cc:dd:ee:ff>\r\n");
+		at_printf(ATCMD_ERROR_END_STR, 1);
+		return;
+	}
+
+	if (parse_mac_str(argv[2], mac) != 0) {
+		at_printf("\r\nInvalid MAC (must be unicast and non-zero).\r\n");
+		at_printf(ATCMD_ERROR_END_STR, 2);
+		return;
+	}
+
+#ifdef CONFIG_WLAN
+	if ((strcasecmp(argv[1], "STA") == 0) || (strcasecmp(argv[1], "0") == 0)) {
+		if (wifi_set_mac_address(0, mac, 0) == RTK_SUCCESS) {
+			print_mac_line("STA MAC set", mac);
+			at_printf(ATCMD_OK_END_STR);
+		} else {
+			at_printf(ATCMD_ERROR_END_STR, 3);
+		}
+		return;
+	}
+	if ((strcasecmp(argv[1], "AP") == 0) || (strcasecmp(argv[1], "1") == 0)) {
+		if (wifi_set_mac_address(1, mac, 0) == RTK_SUCCESS) {
+			print_mac_line("AP MAC set", mac);
+			at_printf(ATCMD_OK_END_STR);
+		} else {
+			at_printf(ATCMD_ERROR_END_STR, 3);
+		}
+		return;
+	}
+#endif /* CONFIG_WLAN */
+
+#if defined(CONFIG_ETHERNET) || defined(CONFIG_LWIP_USB_ETHERNET)
+	if (strcasecmp(argv[1], "ETH") == 0) {
+		Ethernet_SetMacAddr(mac);
+		/* Keep lwIP netif hwaddr in sync (if present). */
+#ifdef CONFIG_LWIP_LAYER
+		u8 *eth_hwaddr = LwIP_GetMAC(NETIF_ETH_INDEX);
+		if (eth_hwaddr) {
+			memcpy((void *)eth_hwaddr, (const void *)mac, 6);
+		}
+#endif
+		print_mac_line("ETH MAC set", mac);
+		at_printf(ATCMD_OK_END_STR);
+		return;
+	}
+#endif
+
+	at_printf("\r\nUnknown interface. Use STA/AP/ETH.\r\n");
+	at_printf(ATCMD_ERROR_END_STR, 4);
+}
+
 log_item_t at_sys_common_items[] = {
 	{"+RREG", at_rreg, {NULL, NULL}},
 	{"+WREG", at_wreg, {NULL, NULL}},
@@ -626,6 +773,7 @@ log_item_t at_sys_common_items[] = {
 	{"+LOG", at_log, {NULL, NULL}},
 	{"+TICKPS", at_tickps, {NULL, NULL}},
 	{"+STATE", at_state, {NULL, NULL}},
+	{"+MAC", at_mac, {NULL, NULL}},
 #ifndef CONFIG_INIC_NO_FLASH
 #if (configGENERATE_RUN_TIME_STATS == 1)
 	{"+CPULOAD", at_cpuload, {NULL, NULL}},
