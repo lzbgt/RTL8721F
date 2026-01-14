@@ -108,8 +108,11 @@ def main():
     parser.add_argument(
         '--post-reset',
         choices=['none', 'dtr', 'rts', 'both', 'dtr-inv', 'rts-inv', 'both-inv', 'auto'],
-        default='auto',
-        help='After flashing succeeds, pulse UART DTR/RTS to reset the board (best-effort).',
+        default='none',
+        help=(
+            'Optional: after flashing succeeds, pulse UART DTR/RTS to reset the board (best-effort). '
+            'Default is none because many boards use DTR/RTS for download-mode selection.'
+        ),
     )
 
     args = parser.parse_args()
@@ -219,9 +222,8 @@ def main():
     if rc != 0:
         sys.exit(1)
 
-    # Realtek flasher can issue a reset, but many boards remain in ROM download mode
-    # unless a physical button/strap is released. Still, default to a best-effort
-    # DTR/RTS pulse so the common workflow "flash -> run" needs fewer manual steps.
+    # Realtek flasher already resets the device unless --no-reset is used.
+    # DTR/RTS pulsing is optional because on some boards it can force ROM download mode.
     if (not args.no_reset) and ports and args.post_reset != "none":
         try:
             post_reset(ports[0], args.post_reset)

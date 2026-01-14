@@ -91,11 +91,14 @@ def main():
     parser.add_argument(
         '--pre-reset',
         choices=['none', 'dtr', 'rts', 'both', 'dtr-inv', 'rts-inv', 'both-inv', 'auto'],
-        default='auto',
-        help='Pulse UART DTR/RTS before attaching to the serial monitor (best-effort).',
+        default='none',
+        help='Optional: pulse UART DTR/RTS before attaching (best-effort). Default is none.',
     )
-    parser.add_argument('-reset', action='store_true', 
-                       help='Enable reset mode: Wait 100ms after connection to send "reboot" command, start output only after detecting "ROM:["')
+    parser.add_argument(
+        '--no-reset',
+        action='store_true',
+        help='Do not send the soft reset ("reboot") command before monitoring.',
+    )
     parser.add_argument('-debug', action='store_true', 
                        help='Enable debug mode: Display raw hexadecimal data of sent and received bytes')
     parser.add_argument('--remote-server', type=str, help='remote serial server IP address')
@@ -117,7 +120,6 @@ def main():
 
     port = args.port
     baudrate = args.baudrate
-    reset = args.reset
     debug = args.debug
     log = args.log
     log_dir = args.log_dir
@@ -129,8 +131,7 @@ def main():
     if not port:
         raise ValueError("Serial port is invalid")
 
-    # Default behavior: try to reset once so the monitor usually starts at boot logs.
-    # This cannot override a physical BOOT/download-mode strap/button.
+    # Optional: hardware-line reset pulse. This cannot override a physical BOOT/download strap.
     try:
         pre_reset(port, args.pre_reset)
     except Exception:
@@ -146,7 +147,8 @@ def main():
     cmds.append("--timestamps")
     cmds.append("--target-os")
     cmds.append("freertos")
-    if reset:
+    # Default behavior: do a soft reset so the monitor starts from clean boot logs.
+    if not args.no_reset:
         cmds.append("--reset")
     if debug:
         cmds.append("--debug")
