@@ -80,6 +80,13 @@ ameba_list_append(private_sources
     ameba_sdio_device.c
 )
 
+if(CONFIG_ETHERNET_RMII)
+    ameba_list_append(private_sources
+        ameba_ethernet.c
+        ameba_phy8201fr.c
+    )
+endif()
+
 ameba_list_append(private_includes
     ${c_CMPT_DOWNLOAD_USB_DIR}
 )

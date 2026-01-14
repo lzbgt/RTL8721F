@@ -9,7 +9,7 @@
 #include "ethernet_ex_api.h"
 #include "timer_api.h"
 #include "kv.h"
-#include "wifi_hal_eeprom.h"
+#include "ameba_usrcfg.h"
 static const char *const TAG = "RMII";
 
 
@@ -138,7 +138,9 @@ void mii_intr_thread(void *param)
 					netifapi_netif_set_up(pnetif_eth);
 				}
 				LwIP_SetIP(NETIF_ETH_INDEX, ip, netmask, gw);
-				netif_set_default(pnetif_eth);
+				if (ethernet_if_default == 1) {
+					netif_set_default(pnetif_eth);
+				}
 				eth_iptab[3] = (uint8_t)(ip >> 24);
 				eth_iptab[2] = (uint8_t)(ip >> 16);
 				eth_iptab[1] = (uint8_t)(ip >> 8);
@@ -150,17 +152,17 @@ void mii_intr_thread(void *param)
 				}
 
 				if (DHCP_ADDRESS_ASSIGNED == dhcp_status) {
-					if (1 == ethernet_if_default) {
-						netif_set_default(pnetif_eth);    //Set default gw to ether netif
-					} else {
-						netif_set_default(pnetif_eth);
+					if (ethernet_if_default == 1) {
+						netif_set_default(pnetif_eth);    //Set default gw to ethernet netif
 					}
 				}
 			}
 			break;
 		} else {
 			netif_set_link_down(pnetif_eth);
-			netif_set_default(pnetif_eth);
+			if (ethernet_if_default == 1) {
+				netif_set_default(pnetif_eth);
+			}
 			LwIP_ReleaseIP(NETIF_ETH_INDEX);
 		}
 
@@ -216,7 +218,7 @@ void ethernet_demo(void *param)
 	u8 sMacAddr[6] = {0x00, 0xE0, 0x4C, 0xb7, 0x23, 0x00};
 	u8 eth_mac[6];
 	u8 random = 0;
-	u8 *hwinfo;
+	struct rtw_mac efuse_mac = {0};
 
 	/* Initilaize the LwIP stack */
 	// can not init twice
@@ -258,12 +260,13 @@ void ethernet_demo(void *param)
 	peth_initstruct->ETH_TxPktBuf = (u8 *)pTmpTxPktBuf;
 	peth_initstruct->ETH_RxPktBuf = (u8 *)pTmpRxPktBuf;
 
-	hwinfo = (u8 *)rtos_mem_zmalloc(OTP_LMAP_LEN);
-	OTP_LogicalMap_Read(hwinfo, 0, OTP_LMAP_LEN);
+	if (wifi_get_mac_address(0, &efuse_mac, 1) == RTK_SUCCESS) {
+		memcpy(eth_mac, efuse_mac.octet, ETH_MAC_ADDR_LEN);
+	} else {
+		memcpy(eth_mac, sMacAddr, ETH_MAC_ADDR_LEN);
+	}
 
-	memcpy(eth_mac, &hwinfo[EEPROM_MAC_ADDR], ETH_ALEN);
-
-	if (!memcmp(&hwinfo[EEPROM_MAC_ADDR], "\xff\xff\xff\xff\xff\xff", ETH_ALEN)) {
+	if (!memcmp(eth_mac, "\xff\xff\xff\xff\xff\xff", ETH_MAC_ADDR_LEN)) {
 		random = (u8)(_rand() % 1000) & 0xFE;
 		sMacAddr[5] = random;
 		for (int i = 0; i < 6; i++) {
@@ -272,8 +275,10 @@ void ethernet_demo(void *param)
 	} else {
 		if (wifi_user_config.softap_addr_offset_idx == 0) {
 			eth_mac[wifi_user_config.softap_addr_offset_idx] += (3 << 1);
-		} else {
+		} else if (wifi_user_config.softap_addr_offset_idx < ETH_MAC_ADDR_LEN) {
 			eth_mac[wifi_user_config.softap_addr_offset_idx] += 3;
+		} else {
+			eth_mac[ETH_MAC_ADDR_LEN - 1] += 3;
 		}
 	}
 
@@ -298,8 +303,6 @@ void ethernet_demo(void *param)
 	if (RTK_SUCCESS != rtos_task_create(NULL, "mii_rx_thread", mii_rx_thread, NULL, 1024, 5)) {
 		RTK_LOGE(TAG, "\n\r%s xTaskCreate(mii_rx_thread) failed", __FUNCTION__);
 	}
-
-	rtos_mem_free(hwinfo);
 
 	rtos_task_delete(NULL);
 }
