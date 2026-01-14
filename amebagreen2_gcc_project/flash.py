@@ -89,6 +89,94 @@ def post_reset(port: str, mode: str) -> None:
     _post_reset(port, mode, inverted=False)
 
 
+def _sniff_uart_state(port: str, baud: int) -> str:
+    """
+    Best-effort classification:
+      - 'rom'    : mostly 0x15 (NAK) spam
+      - 'alive'  : boot logs or shell prompt observed
+      - 'unknown': nothing meaningful observed
+    """
+    try:
+        import serial  # type: ignore
+    except Exception:
+        return "unknown"
+
+    try:
+        ser = serial.Serial(port, baudrate=baud, timeout=0.2)
+    except Exception:
+        return "unknown"
+
+    buf = bytearray()
+    try:
+        ser.reset_input_buffer()
+        end = time.time() + 0.6
+        while time.time() < end:
+            b = ser.read(4096)
+            if b:
+                buf.extend(b)
+
+        # Try to elicit a prompt if we're already in shell state.
+        try:
+            ser.write(b"\r\n")
+        except Exception:
+            pass
+
+        end = time.time() + 0.6
+        while time.time() < end:
+            b = ser.read(4096)
+            if b:
+                buf.extend(b)
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+    if not buf:
+        return "unknown"
+
+    if b"BOOT" in buf or b"ROM:[" in buf or b"IMG" in buf or b"\n#\r\n" in buf or b"\r\n#\r\n" in buf:
+        return "alive"
+
+    if all(c == 0x15 for c in buf) and len(buf) >= 16:
+        return "rom"
+
+    if buf.count(0x15) >= 16 and set(buf).issubset({0x15, 0x0D, 0x0A}):
+        return "rom"
+
+    return "unknown"
+
+
+def auto_exit_rom_download_mode(port: str, baud: int) -> None:
+    """
+    If the board appears stuck in ROM download mode after flashing, try common
+    DTR/RTS reset/boot sequences to return to normal flash boot.
+
+    This is best-effort and depends on your USB-UART wiring.
+    """
+    if _sniff_uart_state(port, baud) != "rom":
+        return
+
+    candidates = [
+        # (reset-line mode, optional inverted)
+        ("rts", False),
+        ("rts", True),
+        ("dtr", False),
+        ("dtr", True),
+        ("both", False),
+        ("both", True),
+    ]
+
+    for mode, inverted in candidates:
+        try:
+            _post_reset(port, mode, inverted=inverted)
+        except Exception:
+            continue
+        time.sleep(0.25)
+        if _sniff_uart_state(port, baud) != "rom":
+            return
+
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -108,10 +196,10 @@ def main():
     parser.add_argument(
         '--post-reset',
         choices=['none', 'dtr', 'rts', 'both', 'dtr-inv', 'rts-inv', 'both-inv', 'auto'],
-        default='none',
+        default='auto',
         help=(
-            'Optional: after flashing succeeds, pulse UART DTR/RTS to reset the board (best-effort). '
-            'Default is none because many boards use DTR/RTS for download-mode selection.'
+            'After flashing succeeds, optionally pulse UART DTR/RTS to reset (best-effort). '
+            "Default is 'auto' (only attempts if the device appears stuck in ROM download mode)."
         ),
     )
 
@@ -223,10 +311,13 @@ def main():
         sys.exit(1)
 
     # Realtek flasher already resets the device unless --no-reset is used.
-    # DTR/RTS pulsing is optional because on some boards it can force ROM download mode.
+    # Optional DTR/RTS handling helps if the board is stuck in ROM download mode.
     if (not args.no_reset) and ports and args.post_reset != "none":
         try:
-            post_reset(ports[0], args.post_reset)
+            if args.post_reset == "auto":
+                auto_exit_rom_download_mode(ports[0], serial_baudrate)
+            else:
+                post_reset(ports[0], args.post_reset)
         except Exception:
             pass
 
