@@ -91,8 +91,8 @@ def main():
     parser.add_argument(
         '--pre-reset',
         choices=['none', 'dtr', 'rts', 'both', 'dtr-inv', 'rts-inv', 'both-inv', 'auto'],
-        default='none',
-        help='Optional: pulse UART DTR/RTS before attaching (best-effort). Default is none.',
+        default='auto',
+        help='Pulse UART DTR/RTS before attaching (best-effort). Default is auto.',
     )
     parser.add_argument(
         '--reset',
@@ -154,7 +154,7 @@ def main():
     cmds.append("--timestamps")
     cmds.append("--target-os")
     cmds.append("freertos")
-    # Default behavior: do NOT reset (avoid accidentally latching ROM download mode on some boards).
+    # Default behavior: pre-reset is enabled (see --pre-reset). Use --pre-reset none to disable.
     if args.reset and args.no_reset:
         raise ValueError("Use at most one of --reset or --no-reset")
     if args.reset:
