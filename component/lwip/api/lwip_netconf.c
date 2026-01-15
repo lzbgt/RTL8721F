@@ -5,6 +5,11 @@
 #include "wifi_intf_drv_to_upper.h"
 #include "ameba_pmu.h"
 
+#if (defined(CONFIG_WHC_HOST) || defined(CONFIG_WHC_NONE))
+#include "kv.h"
+extern int kv_init_done;
+#endif
+
 #if defined(CONFIG_FAST_DHCP) && CONFIG_FAST_DHCP
 #include "wifi_fast_connect.h"
 #endif
@@ -127,6 +132,29 @@ void LwIP_Init(void)
 #if (defined(CONFIG_LWIP_USB_ETHERNET) || defined(CONFIG_ETHERNET))
 		if (idx == NETIF_ETH_INDEX) {
 			netifapi_netif_add(pnetif_eth, ip_2_ip4(&ipaddr), ip_2_ip4(&netmask), ip_2_ip4(&gw), NULL, &ethernetif_mii_init, &tcpip_input);
+#if (defined(CONFIG_WHC_HOST) || defined(CONFIG_WHC_NONE))
+			/* Apply persisted Ethernet static IP from KV early, so it does not appear to
+			 * "revert" to the compile-time default (e.g. 192.168.0.80) after reboot.
+			 *
+			 * AT+ETHIP=1,<ip>[,<gw>,<netmask>] stores keys:
+			 *   eth_ip, eth_gw, eth_netmask
+			 *
+			 * ethernet_mii.c also applies these on link-up; doing it here makes WLSTATE
+			 * show the saved config even before link is up.
+			 */
+			if (kv_init_done == 1 && rt_kv_size("eth_ip") > 0) {
+				u32_t ip = 0;
+				u32_t gw_ip = 0;
+				u32_t nm_ip = 0xFFFFFF00;
+				(void)rt_kv_get("eth_ip", &ip, 4);
+				(void)rt_kv_get("eth_gw", &gw_ip, 4);
+				if (gw_ip == 0) {
+					gw_ip = (ip & 0xFFFFFF00) | 0x01;
+				}
+				(void)rt_kv_get("eth_netmask", &nm_ip, 4);
+				LwIP_SetIP(NETIF_ETH_INDEX, ip, nm_ip, gw_ip);
+			}
+#endif
 		} else
 #endif
 		{
