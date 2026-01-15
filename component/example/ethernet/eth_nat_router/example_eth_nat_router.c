@@ -35,6 +35,7 @@ static const char *const TAG = "ETH_NAT_ROUTER";
 
 extern struct netif *pnetif_eth;
 extern struct netif *pnetif_sta;
+extern int lwip_init_done;
 
 /* ethernet_mii.c globals */
 extern int dhcp_ethernet_mii;
@@ -49,11 +50,48 @@ static void eth_nat_router_thread(void *param)
 	/* Avoid Ethernet DHCP client. We'll set a static LAN IP. */
 	dhcp_ethernet_mii = 0;
 
-	RTK_LOGI(TAG, "Waiting for Ethernet link...\n");
-	while (pnetif_eth == NULL || !netif_is_link_up(pnetif_eth)) {
+	/*
+	 * On some boards the Ethernet "link change" interrupt is not reported when
+	 * the cable is already connected at boot. The driver thread then never calls
+	 * netif_set_link_up(), leaving lwIP's Ethernet netif in LINK_DOWN state.
+	 *
+	 * Symptom: even with static IPv4 on both sides, ARP/ICMP won't work
+	 * (e.g., Jetson can't ping 192.168.50.1 and module can't ping peer).
+	 *
+	 * Workaround at example level (avoid touching the SDK driver): once lwIP and
+	 * pnetif_eth are ready, if the netif link flag is still down, force it up via
+	 * the lwIP netifapi wrapper.
+	 */
+	int waited_ms = 0;
+	RTK_LOGI(TAG, "Waiting for lwIP init...\n");
+	while (lwip_init_done == 0) {
+		rtos_time_delay_ms(100);
+		waited_ms += 100;
+		if (waited_ms >= 15000) {
+			break;
+		}
+	}
+	if (lwip_init_done == 0) {
+		RTK_LOGW(TAG, "lwIP init timeout; proceeding anyway\n");
+	}
+
+	waited_ms = 0;
+	while (pnetif_eth == NULL) {
+		rtos_time_delay_ms(100);
+		waited_ms += 100;
+		if (waited_ms >= 5000) {
+			break;
+		}
+	}
+
+	if (pnetif_eth == NULL) {
+		RTK_LOGW(TAG, "pnetif_eth is NULL; LAN may not work\n");
+	} else if ((pnetif_eth->flags & NETIF_FLAG_LINK_UP) == 0) {
+		RTK_LOGW(TAG, "Ethernet link state not reported; forcing link up (netifapi)\n");
+		LwIP_netif_set_link_up(NETIF_ETH_INDEX);
+		/* Give tcpip thread a moment to process link-up callbacks. */
 		rtos_time_delay_ms(200);
 	}
-	RTK_LOGI(TAG, "Ethernet link up\n");
 
 	/* Bring up LAN IP on NETIF_ETH_INDEX. */
 	u32 lan_ip = CONCAT_TO_UINT32(LAN_IP0, LAN_IP1, LAN_IP2, LAN_IP3);

@@ -15,6 +15,9 @@ static const char *const TAG = "RMII";
 
 ETH_InitTypeDef eth_initstruct;
 
+volatile u32 g_rmii_tx_call = 0;
+volatile u32 g_rmii_tx_submit = 0;
+volatile u32 g_rmii_tx_getbuf_null = 0;
 
 #define ETH_TXDONE              EthTxDone
 #define ETH_RXDONE              EthRxDone
@@ -125,6 +128,9 @@ void mii_intr_thread(void *param)
 		}
 
 		if (link_is_up) {
+			if (!netif_is_up(pnetif_eth)) {
+				netifapi_netif_set_up(pnetif_eth);
+			}
 			netif_set_link_up(pnetif_eth);
 			if (rt_kv_size("eth_ip") > 0) {
 				u32_t ip, gw = 0, netmask = 0xFFFFFF00;
@@ -160,6 +166,9 @@ void mii_intr_thread(void *param)
 			break;
 		} else {
 			netif_set_link_down(pnetif_eth);
+			if (netif_is_up(pnetif_eth)) {
+				netifapi_netif_set_down(pnetif_eth);
+			}
 			if (ethernet_if_default == 1) {
 				netif_set_default(pnetif_eth);
 			}
@@ -289,13 +298,27 @@ void ethernet_demo(void *param)
 
 	Ethernet_init(&eth_initstruct);
 
+#ifdef CONFIG_AMEBAGREEN2
+	/*
+	 * On some boards, if the Ethernet cable is already connected at boot, the
+	 * PHY/MAC link is up during Ethernet_init() and no subsequent "link up"
+	 * interrupt is generated. mii_intr_thread() waits on mii_linkup_sema before
+	 * calling netif_set_link_up(), so without this nudge lwIP can stay in
+	 * LINK_DOWN and LAN traffic (DHCP/ARP/ICMP) won't work.
+	 */
+	if (link_is_up) {
+		RTK_LOGI(TAG, "Link already up at init; notify link thread\n");
+		rtos_sema_give(mii_linkup_sema);
+	}
+#endif
+
 	memcpy((void *)pnetif_eth->hwaddr, (void *)eth_mac, ETH_MAC_ADDR_LEN);
 
 	rtos_sema_create_binary(&mii_rx_sema);
 	rtos_mutex_create(&rmii_tx_mutex);
 
 #ifndef CONFIG_RMII_VERIFY
-	netif_set_up(pnetif_eth);
+	netifapi_netif_set_up(pnetif_eth);
 #endif
 
 	rtos_sema_give(ethernet_init_done);
@@ -332,6 +355,8 @@ void ethernet_pin_config(void)
 
 	Pinmux_Config(ETHERNET_PAD[ETHERNET_Pin_Grp][8], PINMUX_FUNCTION_RMII_MDC);
 	Pinmux_Config(ETHERNET_PAD[ETHERNET_Pin_Grp][9], PINMUX_FUNCTION_RMII_MDIO);
+	/* MDIO is open-drain; ensure it isn't stuck-low if the board lacks an external pull-up. */
+	PAD_PullCtrl(ETHERNET_PAD[ETHERNET_Pin_Grp][9], GPIO_PuPd_UP);
 
 #ifndef CONFIG_PHY_INT_XTAL
 	Pinmux_Config(ETHERNET_PAD[ETHERNET_Pin_Grp][10], PINMUX_FUNCTION_EXT_CLK_OUT);
@@ -405,6 +430,7 @@ int rltk_mii_send(struct pbuf *p)
 	struct pbuf *q;
 	u8 *rmii_buf = NULL;
 
+	g_rmii_tx_call++;
 	rtos_mutex_take(rmii_tx_mutex, MUTEX_WAIT_TIMEOUT);
 	rmii_buf = Ethernet_GetTXPktInfo(&eth_initstruct);
 	if (rmii_buf) {/*copy from lwip to rmii*/
@@ -414,8 +440,10 @@ int rltk_mii_send(struct pbuf *p)
 			size += q->len;
 		}
 		Ethernet_UpdateTXDESCAndSend(&eth_initstruct, size);
+		g_rmii_tx_submit++;
 		ret = 0;
 	} else {
+		g_rmii_tx_getbuf_null++;
 		ret = -1;
 	}
 

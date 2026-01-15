@@ -101,7 +101,12 @@ void ping_test(void *param)
 		goto cleanup_addrinfo;
 	}
 
+	/* Bind to a specific interface IP (helps route the ping via the chosen netif). */
+#if (defined(CONFIG_LWIP_USB_ETHERNET) || defined(CONFIG_ETHERNET))
+	if ((ping_interface == 0) || (ping_interface == 1) || (ping_interface == NETIF_ETH_INDEX)) {
+#else
 	if ((ping_interface == 0) || (ping_interface == 1)) {
+#endif
 		if (family == AF_INET) {
 			struct sockaddr_in bind_addr = {
 				.sin_family = AF_INET,
@@ -326,10 +331,20 @@ int cmd_ping(int argc, char **argv)
 					goto Exit;
 				}
 				ping_interface = (int)strtol(argv[argv_count], &endptr, 10);
-				if (*endptr != '\0' || endptr == argv[argv_count] || (ping_interface != 0 && ping_interface != 1)) {
+				/* 0: STA, 1: AP, 2: Ethernet (when enabled) */
+#if (defined(CONFIG_LWIP_USB_ETHERNET) || defined(CONFIG_ETHERNET))
+				if (*endptr != '\0' || endptr == argv[argv_count] ||
+					(ping_interface != NETIF_WLAN_STA_INDEX && ping_interface != NETIF_WLAN_AP_INDEX && ping_interface != NETIF_ETH_INDEX)) {
 					error_no = 2;
 					goto Exit;
 				}
+#else
+				if (*endptr != '\0' || endptr == argv[argv_count] ||
+					(ping_interface != NETIF_WLAN_STA_INDEX && ping_interface != NETIF_WLAN_AP_INDEX)) {
+					error_no = 2;
+					goto Exit;
+				}
+#endif
 				argv_count += 2;
 			} else {
 				error_no = 2;

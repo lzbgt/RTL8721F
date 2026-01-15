@@ -27,6 +27,9 @@ static void at_ping_help(void)
 	RTK_LOGI(NOTAG, "\t\t-n\t#\tnumber of echo requests to send (default 4 times)\r\n");
 	RTK_LOGI(NOTAG, "\t\t-l\t#\tsend buffer size (default 32 bytes)\r\n");
 	RTK_LOGI(NOTAG, "\t\tif\t#\tspecify ping interface, 0 is for STA and 1 is for soft\r\n");
+#if (defined(CONFIG_LWIP_USB_ETHERNET) || defined(CONFIG_ETHERNET))
+	RTK_LOGI(NOTAG, "\t\t\t\t\t(2 is for ethernet when enabled)\r\n");
+#endif
 	RTK_LOGI(NOTAG, "\tExample:\r\n");
 	RTK_LOGI(NOTAG, "\t\tAT+PING=192.168.1.2,-n,100,-l,5000\r\n");
 }

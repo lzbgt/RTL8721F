@@ -27,7 +27,7 @@ def _find_gdb():
         return 'arm-none-eabi-gdb'
 
 
-CMAKE_GDB = _find_gdb()
+CMAKE_GDB = 'C:/rtk-toolchain/asdk-12.3.1-4568/mingw32/newlib/bin/arm-none-eabi-gdb.exe'
 PROJECT_DIR = os.getcwd()
 ASDK = os.path.join(PROJECT_DIR, 'project_km4tz/asdk')
 GNU_SCRIPT =  os.path.join(ASDK, 'gnu_utility/gnu_script')
