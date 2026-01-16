@@ -12,6 +12,10 @@
 #include "rtw_coex_ipc.h"
 #endif
 #include "ameba_diagnose.h"
+#include "ameba_chipinfo.h"
+#include "ameba_syscfg.h"
+#include "ameba_boot.h"
+#include "ameba_spic.h"
 
 static const char *const TAG = "MAIN";
 u32 use_hw_crypto_func;
@@ -146,11 +150,123 @@ void CPU1_WDG_RST_Handler(void)
 	HAL_WRITE32(SYSTEM_CTRL_BASE, REG_AON_BOOT_REASON_HW, AON_BIT_RSTF_WDG0_CPU);
 }
 
+static const char *bdnum_to_str(u16 bd_num)
+{
+	switch (bd_num) {
+	case SYSCFG_BD_QFN32:
+		return "QFN32";
+	case SYSCFG_BD_QFN48_MCM_8MBFlash:
+		return "QFN48_MCM_8MBFlash";
+	case SYSCFG_BD_QFN48:
+		return "QFN48";
+	case SYSCFG_BD_QFN68:
+		return "QFN68";
+	case SYSCFG_BD_QFN68_NEW:
+		return "QFN68_NEW";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+static const char *psram_vendor_to_str(u16 vendor)
+{
+	switch (vendor) {
+	case MCM_PSRAM_VENDOR_APM:
+		return "APM";
+	case MCM_PSRAM_VENDOR_WB:
+		return "WB";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+static const char *psram_dqx_to_str(u16 dqx)
+{
+	switch (dqx) {
+	case MCM_PSRAM_DQ8:
+		return "DQ8";
+	case MCM_PSRAM_DQ16:
+		return "DQ16";
+	default:
+		return "DQ?";
+	}
+}
+
+static const char *flash_type_to_str(u16 mem_type)
+{
+	if (mem_type & MCM_TYPE_NOR_FLASH) {
+		return "NOR";
+	}
+	if (mem_type & MCM_TYPE_NAND_FLASH) {
+		return "NAND";
+	}
+	return "NONE";
+}
+
+static uint64_t spic_flash_size_bytes(void)
+{
+	SPIC_TypeDef *spic = SPIC;
+	const u32 reg = spic->FLASE_SIZE;
+	const u32 exp = GET_FLASH_SIZE(reg) + 15; /* log2(size) - 15 stored */
+	if (exp >= 63) {
+		return 0;
+	}
+	return 1ULL << exp;
+}
+
+static void app_hw_info_print(void)
+{
+	char soc_name[32] = {0};
+	ChipInfo_GetSocName_ToBuf(soc_name, sizeof(soc_name));
+
+	const u8 cut = EFUSE_GetChipVersion();
+	const u8 chip_info = EFUSE_GetChipInfo();
+	const u16 bd_num = ChipInfo_BDNum();
+	const MCM_MemTypeDef mcm = ChipInfo_MCMInfo();
+
+	const uint64_t psram_bytes = (mcm.mem_type & MCM_TYPE_PSRAM) ? (uint64_t)MCM_MEM_SIZE_IN_BYTES(mcm.dram_info.density) : 0ULL;
+	const uint64_t mcm_flash_bytes = (mcm.mem_type & (MCM_TYPE_NOR_FLASH | MCM_TYPE_NAND_FLASH)) ? (uint64_t)MCM_MEM_SIZE_IN_BYTES(mcm.flash_density) : 0ULL;
+	const uint64_t ext_flash_bytes = spic_flash_size_bytes();
+
+	const size_t bdram_heap_bytes = (size_t)__bdram_heap_buffer_size__;
+	const size_t psram_heap_bytes = (size_t)__psram_heap_buffer_size__;
+	const size_t psram_heap_ext_bytes = (size_t)__psram_heap_extend_size__;
+
+	const uint32_t heap_free_bytes = rtos_mem_get_free_heap_size();
+	const uint32_t heap_min_ever_free_bytes = rtos_mem_get_minimum_ever_free_heap_size();
+
+	RTK_LOGI(TAG, "HW: SoC=%s chip_info=0x%02x RL=0x%lx cut=%c bd=0x%04x(%s)\n",
+			 soc_name,
+			 (unsigned int)chip_info,
+			 (u32)SYSCFG_GetRLNum(),
+			 (cut == SYSCFG_CUT_VERSION_A) ? 'A' : (cut == SYSCFG_CUT_VERSION_B) ? 'B' : '?',
+			 (unsigned int)bd_num,
+			 bdnum_to_str(bd_num));
+
+	RTK_LOGI(TAG, "HW: SRAM(heap)=0x%lx PSRAM(MCM)=%lu bytes(%s/%s) PSRAM(heap)=0x%lx ext=0x%lx\n",
+			 (u32)bdram_heap_bytes,
+			 (u32)psram_bytes,
+			 psram_vendor_to_str(mcm.dram_info.model),
+			 psram_dqx_to_str(mcm.dram_info.dqx),
+			 (u32)psram_heap_bytes,
+			 (u32)psram_heap_ext_bytes);
+
+	RTK_LOGI(TAG, "HW: Flash(MCM/internal)=%lu bytes(%s) Flash(SPIC/external)=%lu bytes\n",
+			 (u32)mcm_flash_bytes,
+			 flash_type_to_str(mcm.mem_type),
+			 (u32)ext_flash_bytes);
+
+	RTK_LOGI(TAG, "HW: Heap free=%lu min_ever_free=%lu\n",
+			 (u32)heap_free_bytes,
+			 (u32)heap_min_ever_free_bytes);
+}
+
 //default main
 int main(void)
 {
 	RTK_LOGI(TAG, "AP MAIN \n");
 	ameba_rtos_get_version();
+	app_hw_info_print();
 
 #if (!defined (CONFIG_WHC_INTF_IPC) && defined (CONFIG_WHC_DEV))
 	app_fullmac_init();
