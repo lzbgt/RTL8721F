@@ -21,9 +21,22 @@ extern struct netif *pnetif_eth;
 extern volatile u32 g_rmii_tx_call;
 extern volatile u32 g_rmii_tx_submit;
 extern volatile u32 g_rmii_tx_getbuf_null;
+extern u8 g_eth_mdc_pin;
+extern u8 g_eth_mdio_pin;
 extern ETH_InitTypeDef eth_initstruct;
 extern u8 ETHERNET_Pin_Grp;
 extern void ethernet_pin_config(void);
+
+static int _eth_is_valid_phy_id(uint16_t id1, uint16_t id2)
+{
+	if ((id1 == 0x0000 && id2 == 0x0000) || (id1 == 0xFFFF && id2 == 0xFFFF)) {
+		return 0;
+	}
+	if (id1 == 0x0000 || id1 == 0xFFFF || id2 == 0x0000 || id2 == 0xFFFF) {
+		return 0;
+	}
+	return 1;
+}
 
 static void at_ethip_help(void)
 {
@@ -179,7 +192,14 @@ static void _print_eth_pins(void)
 	}
 	for (unsigned int i = 0; i < 11; i++) {
 		char pin_str[8] = {0};
-		const uint8_t pin = ETHERNET_PAD[ETHERNET_Pin_Grp][i];
+		uint8_t pin = ETHERNET_PAD[ETHERNET_Pin_Grp][i];
+		/* If the driver auto-detected an MDC/MDIO override, show the effective pins. */
+		if (i == 8 && g_eth_mdc_pin != 0xFF) {
+			pin = g_eth_mdc_pin;
+		}
+		if (i == 9 && g_eth_mdio_pin != 0xFF) {
+			pin = g_eth_mdio_pin;
+		}
 		_pin_to_str(pin, pin_str, sizeof(pin_str));
 		/* Avoid printf field-width formatting: some console builds don't support it. */
 		at_printf("PAD[%u] %s=%s (0x%02x)\r\n", i, names[i], pin_str, (unsigned int)pin);
@@ -417,7 +437,28 @@ void at_ethstat(void *arg)
 	uint32_t msr = rmii->ETH_MSR;
 	unsigned int link_ok = (((msr >> 26) & 0x1U) == 0) ? 1U : 0U;
 	unsigned int speed_code = (unsigned int)((msr >> 27) & 0x3U);
-	const char *speed_str = (speed_code == 0) ? "100M" : (speed_code == 1) ? "10M" : (speed_code == 2) ? "1000M" : "invalid";
+	const unsigned int sel_rgmii = (unsigned int)((msr >> 23) & 0x1U);
+	const unsigned int sel_mii = (unsigned int)((msr >> 20) & 0x1U);
+	/* Note: This MAC supports 10/100/1000 in general, but RMII boards are 10/100 only.
+	 * When MDIO auto-polling is not working, the SPEED bits can be meaningless. */
+	const char *speed_str = NULL;
+	if (speed_code == 0) {
+		speed_str = "100M";
+	} else if (speed_code == 1) {
+		speed_str = "10M";
+	} else if (speed_code == 2) {
+		speed_str = "1000M";
+	} else {
+		speed_str = "invalid";
+	}
+	if (sel_rgmii == 0 && sel_mii == 0) {
+		/* Likely RMII: clamp the interpretation to 10/100 only. */
+		if (speed_code == 2) {
+			speed_str = "invalid(RMII-10/100-only)";
+		} else if (speed_code == 3) {
+			speed_str = "invalid(RMII)";
+		}
+	}
 	at_printf("MAC: ETH_MSR=0x%08x (LINK_OK=%u SPEED=%s FULLDUP=%u NWAY_DONE=%u)\r\n",
 			  (unsigned int)msr,
 			  link_ok,
@@ -425,8 +466,8 @@ void at_ethstat(void *arg)
 			  (unsigned int)((msr >> 22) & 0x1U),
 			  (unsigned int)((msr >> 21) & 0x1U));
 	at_printf("MAC: msr_sel_rgmii=%u msr_sel_mii=%u gmac_phy_mode=%u forcelink=%u forcedfull=%u force_spd=%u\r\n",
-			  (unsigned int)((msr >> 23) & 0x1U),
-			  (unsigned int)((msr >> 20) & 0x1U),
+			  sel_rgmii,
+			  sel_mii,
 			  (unsigned int)((msr >> 13) & 0x1U),
 			  (unsigned int)((msr >> 18) & 0x1U),
 			  (unsigned int)((msr >> 19) & 0x1U),
@@ -588,6 +629,130 @@ void at_ethscan(void *arg)
 	Ethernet_AutoPolling(ENABLE);
 	at_printf(ATCMD_OK_END_STR);
 }
+
+static void at_ethmdio_help(void)
+{
+	RTK_LOGI(NOTAG, "\r\n");
+	RTK_LOGI(NOTAG, "AT+ETHMDIO=<mdc_pin>,<mdio_pin>\r\n");
+	RTK_LOGI(NOTAG, "\tPins use the numeric ID shown in AT+ETHSTAT (hex ok): e.g. PB12=0x2c PB3=0x23\r\n");
+	RTK_LOGI(NOTAG, "AT+ETHMDIO=default\r\n");
+	RTK_LOGI(NOTAG, "\tReset to ETHERNET_PAD table pins for the current ETHERNET_Pin_Grp\r\n");
+	RTK_LOGI(NOTAG, "AT+ETHMDIOAUTO\r\n");
+}
+
+static void _at_print_mdio_pins(void)
+{
+	at_printf("MDC pin=0x%02x MDIO pin=0x%02x\r\n",
+			  (unsigned int)g_eth_mdc_pin,
+			  (unsigned int)g_eth_mdio_pin);
+}
+
+static void at_ethmdio(void *arg)
+{
+	char *argv[MAX_ARGC] = {0};
+	int argc = 0;
+	int error_no = 0;
+
+	at_printf("[+ETHMDIO]\r\n");
+
+	if (arg == NULL) {
+		_at_print_mdio_pins();
+		at_ethmdio_help();
+		at_printf(ATCMD_OK_END_STR);
+		return;
+	}
+
+	argc = parse_param(arg, argv);
+	if (argc == 2 && argv[1] != NULL && (!strcmp(argv[1], "default") || !strcmp(argv[1], "DEFAULT"))) {
+		g_eth_mdc_pin = 0xFF;
+		g_eth_mdio_pin = 0xFF;
+		ethernet_pin_config();
+		_at_print_mdio_pins();
+		at_printf(ATCMD_OK_END_STR);
+		return;
+	}
+
+	if (argc != 3 || argv[1] == NULL || argv[2] == NULL || argv[1][0] == '\0' || argv[2][0] == '\0') {
+		error_no = 1;
+		goto end;
+	}
+
+	unsigned long mdc = strtoul(argv[1], NULL, 0);
+	unsigned long mdio = strtoul(argv[2], NULL, 0);
+	if (mdc > 0xFF || mdio > 0xFF) {
+		error_no = 1;
+		goto end;
+	}
+
+	g_eth_mdc_pin = (u8)mdc;
+	g_eth_mdio_pin = (u8)mdio;
+	ethernet_pin_config();
+	_at_print_mdio_pins();
+
+end:
+	if (error_no == 0) {
+		at_printf(ATCMD_OK_END_STR);
+	} else {
+		at_ethmdio_help();
+		at_printf(ATCMD_ERROR_END_STR, 1);
+	}
+}
+
+static void at_ethmdioauto(void *arg)
+{
+	(void)arg;
+	at_printf("[+ETHMDIOAUTO]\r\n");
+
+	struct {
+		u8 mdc;
+		u8 mdio;
+		const char *name;
+	} cands[] = {
+		/* HDK-EV711FL0-3V2: MDC=PC1, MDIO=PB24 (ETHERNET_Pin_Grp=2) */
+		{_PC_1, _PB_24, "PC1/PB24"},
+		{_PB_12, _PB_3,  "PB12/PB3"},
+		{_PB_13, _PB_12, "PB13/PB12"},
+	};
+
+	uint16_t id1 = 0, id2 = 0;
+	static const uint8_t probe_addrs[] = {1, 0};
+
+	Ethernet_AutoPolling(DISABLE);
+	rtos_time_delay_ms(2);
+
+	for (unsigned int i = 0; i < (sizeof(cands) / sizeof(cands[0])); i++) {
+		g_eth_mdc_pin = cands[i].mdc;
+		g_eth_mdio_pin = cands[i].mdio;
+		ethernet_pin_config();
+		rtos_time_delay_ms(2);
+
+		for (unsigned int j = 0; j < (sizeof(probe_addrs) / sizeof(probe_addrs[0])); j++) {
+			const uint8_t addr = probe_addrs[j];
+			if (Ethernet_ReadPhyReg(addr, 2, &id1) != RTK_SUCCESS) {
+				continue;
+			}
+			if (Ethernet_ReadPhyReg(addr, 3, &id2) != RTK_SUCCESS) {
+				continue;
+			}
+			if (_eth_is_valid_phy_id(id1, id2)) {
+				at_printf("MDC/MDIO autodetect: using %s (PHY@%u ID1=0x%04x ID2=0x%04x)\r\n",
+						  cands[i].name, (unsigned int)addr, (unsigned int)id1, (unsigned int)id2);
+				Ethernet_AutoPolling(ENABLE);
+				at_printf(ATCMD_OK_END_STR);
+				return;
+			}
+		}
+	}
+
+	/* Fall back to table mapping. */
+	g_eth_mdc_pin = 0xFF;
+	g_eth_mdio_pin = 0xFF;
+	ethernet_pin_config();
+	at_printf("MDC/MDIO autodetect: failed; using ETHERNET_PAD table\r\n");
+
+	Ethernet_AutoPolling(ENABLE);
+	at_printf(ATCMD_OK_END_STR);
+}
 #endif
 
 log_item_t at_ethernet_items[ ] = {
@@ -596,6 +761,8 @@ log_item_t at_ethernet_items[ ] = {
 	{"+ETHSTAT", at_ethstat, {NULL, NULL}},
 	{"+ETHSTATE", at_ethstat, {NULL, NULL}},
 	{"+ETHSCAN", at_ethscan, {NULL, NULL}},
+	{"+ETHMDIO", at_ethmdio, {NULL, NULL}},
+	{"+ETHMDIOAUTO", at_ethmdioauto, {NULL, NULL}},
 	{"+ETHGRP", at_ethgrp, {NULL, NULL}},
 	{"+ETHUP", at_ethup, {NULL, NULL}},
 	{"+ETHDOWN", at_ethdown, {NULL, NULL}},

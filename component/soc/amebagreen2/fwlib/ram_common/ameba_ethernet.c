@@ -10,6 +10,60 @@ static const char *const TAG = "ETH";
 
 u8 phy_id = PHYID_1;
 #define CHECK_PHY_STATUS
+
+/* Avoid flooding UART when MDIO is dead (clock/reset/wiring issue). */
+static u8 g_mdio_timeout_log_budget = 8;
+static void Ethernet_LogTimeoutOnce(void)
+{
+	if (g_mdio_timeout_log_budget) {
+		g_mdio_timeout_log_budget--;
+		RTK_LOGS(TAG, RTK_LOG_ERROR, "TIME OUT\n");
+	}
+}
+
+static int Ethernet_IsValidPhyId(uint16_t id1, uint16_t id2)
+{
+	/* Clause 22: reg2/reg3 are PHY identifier registers.
+	 * Treat all-0 / all-1 as "no device / floating bus". */
+	if ((id1 == 0x0000 && id2 == 0x0000) || (id1 == 0xFFFF && id2 == 0xFFFF)) {
+		return 0;
+	}
+	/* Some MDIO read failures can return mixed 0xffff/0x0000; reject those too. */
+	if (id1 == 0x0000 || id1 == 0xFFFF || id2 == 0x0000 || id2 == 0xFFFF) {
+		return 0;
+	}
+	return 1;
+}
+
+static u8 Ethernet_DetectPhyAddr(void)
+{
+	/* Keep bring-up fast: try common strap addresses first, avoid a full 0..31 scan
+	 * that can stall boot and spam TIMEOUT logs when MDIO is non-functional. */
+	static const uint8_t probe_addrs[] = {PHYID_1, 0};
+	uint16_t id1 = 0, id2 = 0;
+
+	for (unsigned int i = 0; i < (sizeof(probe_addrs) / sizeof(probe_addrs[0])); i++) {
+		const uint8_t addr = probe_addrs[i];
+		const int r1 = Ethernet_ReadPhyReg(addr, FEPHY_REG_ADDR_2, &id1);
+		if (r1 == -RTK_ERR_BUSY) {
+			return PHYID_1;
+		}
+		if (r1 != RTK_SUCCESS) {
+			continue;
+		}
+		const int r2 = Ethernet_ReadPhyReg(addr, FEPHY_REG_ADDR_3, &id2);
+		if (r2 == -RTK_ERR_BUSY) {
+			return PHYID_1;
+		}
+		if (r2 != RTK_SUCCESS) {
+			continue;
+		}
+		if (Ethernet_IsValidPhyId(id1, id2)) {
+			return addr;
+		}
+	}
+	return PHYID_1;
+}
 /**
   * @brief  clear all interrupt
   * @param  Data: the data pointer to IPCx
@@ -172,6 +226,9 @@ void Ethernet_OutputClk2Phy(u32 pin)
 void Ethernet_AutoPolling(u32 opt)
 {
 	ETHERNET_TypeDef *RMII = ((ETHERNET_TypeDef *) RMII_REG_BASE);
+	if (TrustZone_IsSecure()) {
+		RMII = ((ETHERNET_TypeDef *) RMII_REG_BASE_S);
+	}
 	if (opt == DISABLE) {
 		RMII->ETH_MIIAR |= BIT_DISABLE_AUTO_POLLING;
 	} else {
@@ -338,6 +395,9 @@ u32 Ethernet_GetLinkStatus(void)
 u8 Ethernet_WaitBusy(u32 WaitType)
 {
 	ETHERNET_TypeDef *RMII = ((ETHERNET_TypeDef *) RMII_REG_BASE);
+	if (TrustZone_IsSecure()) {
+		RMII = ((ETHERNET_TypeDef *) RMII_REG_BASE_S);
+	}
 	u32 BusyCheck = 0;
 	u8 status = 0;
 	u32 i = 0;
@@ -363,7 +423,7 @@ u8 Ethernet_WaitBusy(u32 WaitType)
 
 		if (i > 0x200000) {
 			status = 0xFF;
-			RTK_LOGS(TAG, RTK_LOG_ERROR, "TIME OUT\n");
+			Ethernet_LogTimeoutOnce();
 			break;
 		}
 	} while (1);
@@ -377,16 +437,6 @@ u8 Ethernet_WaitBusy(u32 WaitType)
  * @param timeout_us   Timeout threshold in microseconds.
  * @return 0 on success (MDIO idle), -1 on timeout.
  */
-static inline int Ethernet_WaitPhyIdle(ETHERNET_TypeDef *RMII, uint32_t timeout_us)
-{
-	uint32_t start = DTimestamp_Get();
-	while ((DTimestamp_Get() - start) <= timeout_us) {
-		if (!(RMII->ETH_MIIAR & BIT_MDIO_BUSY)) {
-			return RTK_SUCCESS;
-		}
-	}
-	return -RTK_ERR_TIMEOUT;
-}
 /**
  * @brief Reads a 16-bit value from a PHY register via MDIO.
  * @param phy_id     Physical address of the target PHY.
@@ -404,13 +454,23 @@ int Ethernet_ReadPhyReg(uint8_t phy_id, uint8_t reg_addr, uint16_t *data)
 		return -RTK_FAIL;
 	}
 
-	if (Ethernet_WaitPhyIdle(RMII, MDIO_WAIT_TIME) != RTK_SUCCESS) {
-		return -RTK_ERR_BUSY;
+	/* Ensure no previous MDIO transaction is pending.
+	 * WAIT_SMI_READ_DONE depends on FLAG==1, but FLAG can legitimately be 0 when idle,
+	 * so only gate on the MDIO busy flag here. */
+	for (u32 i = 0; i < 0x200000; i++) {
+		if ((RMII->ETH_MIIAR & BIT_MDIO_BUSY) == 0) {
+			break;
+		}
+		if (i == 0x1FFFFF) {
+			Ethernet_LogTimeoutOnce();
+			return -RTK_ERR_BUSY;
+		}
 	}
 
 	RMII->ETH_MIIAR = (PHYADDRESS(phy_id) | REGADDR4_0(reg_addr));
 
-	if (Ethernet_WaitPhyIdle(RMII, MDIO_WAIT_TIME) != RTK_SUCCESS) {
+	/* Wait for read completion: MDIO busy cleared and FLAG toggled to 1. */
+	if (Ethernet_WaitBusy(WAIT_SMI_READ_DONE) == 0xFF) {
 		return -RTK_ERR_BUSY;
 	}
 
@@ -437,11 +497,23 @@ int Ethernet_WritePhyReg(uint8_t phy_id, uint8_t reg_addr, uint16_t data)
 		return -RTK_FAIL;
 	}
 
-	if (Ethernet_WaitPhyIdle(RMII, MDIO_WAIT_TIME) != RTK_SUCCESS) {
-		return -RTK_ERR_BUSY;
+	/* Ensure no previous MDIO transaction is pending (gate on MDIO busy only). */
+	for (u32 i = 0; i < 0x200000; i++) {
+		if ((RMII->ETH_MIIAR & BIT_MDIO_BUSY) == 0) {
+			break;
+		}
+		if (i == 0x1FFFFF) {
+			Ethernet_LogTimeoutOnce();
+			return -RTK_ERR_BUSY;
+		}
 	}
 
 	RMII->ETH_MIIAR = (BIT_FLAG | BIT_DISABLE_AUTO_POLLING | PHYADDRESS(phy_id) | REGADDR4_0(reg_addr) | data);
+
+	/* Wait for write completion: MDIO busy cleared and FLAG cleared to 0. */
+	if (Ethernet_WaitBusy(WAIT_SMI_WRITE_DONE) == 0xFF) {
+		return -RTK_ERR_BUSY;
+	}
 
 	return RTK_SUCCESS;
 }
@@ -487,7 +559,13 @@ void Ethernet_StructInit(ETH_InitTypeDef *ETH_InitStruct)
 	ETH_InitStruct->ETH_RCR = BIT_AAP | BIT_APM | BIT_AM | BIT_AB | BIT_AR | BIT_AER | BIT_AFLOW;
 	ETH_InitStruct->ETH_RxJumbo = ETH_RX_JUMBO_ENABLE;
 	ETH_InitStruct->ETH_RefClkPhase = ETH_SAMPLED_ON_RISING_EDGE;
+#ifdef CONFIG_PHY_INT_XTAL
+	/* PHY provides RMII REF_CLK (typical when PHY has its own 25MHz crystal). */
+	ETH_InitStruct->ETH_RefClkDirec = ETH_REFCLK_OFF;
+#else
+	/* MAC provides RMII clock to PHY via EXT_CLK_OUT. */
 	ETH_InitStruct->ETH_RefClkDirec = ETH_REFCLK_ON;
+#endif
 	ETH_InitStruct->ETH_RxThreshold = ETH_RX_THRESHOLD_256B;
 	ETH_InitStruct->ETH_TxThreshold = ETH_TX_THRESHOLD_256B;
 	ETH_InitStruct->ETH_RxTriggerLevel = ETH_TRIGGER_LEVEL_1_PKT;
@@ -529,40 +607,43 @@ u32 Ethernet_init(ETH_InitTypeDef *ETH_InitStruct)
 	do {
 	} while (RMII->ETH_CR & BIT_RST);
 
-	/* reset phy */
-	PHY_SoftWareReset(PHYID_1);
+	/* Detect PHY address early (board strap-dependent). */
+	phy_id = Ethernet_DetectPhyAddr();
 
-	PHY_SetRefclkDir(PHYID_1, ETH_InitStruct->ETH_RefClkDirec);
+	/* reset phy */
+	PHY_SoftWareReset(phy_id);
+
+	PHY_SetRefclkDir(phy_id, ETH_InitStruct->ETH_RefClkDirec);
 
 #ifdef ENABLE_EEE_FUNCTION
-	PHY_SetEEEMode(PHYID_1, ETH_MAC_MODE);
+	PHY_SetEEEMode(phy_id, ETH_MAC_MODE);
 #endif
 
 #ifdef CHECK_PHY_STATUS
 	uint16_t tmp;
 	/*select page 0*/
-	Ethernet_WritePhyReg(PHYID_1, FEPHY_REG_ADDR_31, FEPHY_REG_PAGE_0);
+	Ethernet_WritePhyReg(phy_id, FEPHY_REG_ADDR_31, FEPHY_REG_PAGE_0);
 
-	Ethernet_ReadPhyReg(PHYID_1, FEPHY_REG_ADDR_0, &tmp);
+	Ethernet_ReadPhyReg(phy_id, FEPHY_REG_ADDR_0, &tmp);
 	RTK_LOGI(TAG, "page0 reg0=0x%x\n", tmp);
 
-	Ethernet_ReadPhyReg(PHYID_1, FEPHY_REG_ADDR_1, &tmp);
+	Ethernet_ReadPhyReg(phy_id, FEPHY_REG_ADDR_1, &tmp);
 	RTK_LOGI(TAG, "page0 reg1=0x%x\n", tmp);
 
-	Ethernet_ReadPhyReg(PHYID_1, FEPHY_REG_ADDR_2, &tmp);
+	Ethernet_ReadPhyReg(phy_id, FEPHY_REG_ADDR_2, &tmp);
 	RTK_LOGI(TAG, "page0 reg2=0x%x\n", tmp);
 
-	Ethernet_ReadPhyReg(PHYID_1, FEPHY_REG_ADDR_3, &tmp);
+	Ethernet_ReadPhyReg(phy_id, FEPHY_REG_ADDR_3, &tmp);
 	RTK_LOGI(TAG, "page0 reg3=0x%x\n", tmp);
 
 	/*select page 7*/
-	Ethernet_WritePhyReg(PHYID_1, FEPHY_REG_ADDR_31, FEPHY_REG_ADDR_7);
+	Ethernet_WritePhyReg(phy_id, FEPHY_REG_ADDR_31, FEPHY_REG_ADDR_7);
 
-	Ethernet_ReadPhyReg(PHYID_1, RTL8201FR_PAGE7_REG_RMII_MODE_SET, &tmp);
+	Ethernet_ReadPhyReg(phy_id, RTL8201FR_PAGE7_REG_RMII_MODE_SET, &tmp);
 	RTK_LOGI(TAG, "page7 reg16=0x%x\n", tmp);
 
 #endif
-	PHY_RestartAutoNego(PHYID_1);
+	PHY_RestartAutoNego(phy_id);
 
 	/* Tx settings */
 

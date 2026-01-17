@@ -55,6 +55,32 @@
 
 #define WIFI_STACK_SIZE_INIT ((512 + 768) * 4)
 
+/* kv.h isn't in the default include path for this component in some SDK builds,
+ * but KV APIs are still linked in (used by AT commands, fast reconnect, etc.). */
+extern int32_t rt_kv_get(const char *key, void *buffer, int32_t len);
+
+/* Persistent Wi-Fi boot policy (KV):
+ * - key: "wifi_on_boot" (u8)
+ * - 0: do not call wifi_on() during boot (keeps Wi-Fi off unless user enables it later)
+ * - 1: call wifi_on() during boot (default behavior)
+ *
+ * If the key doesn't exist, fall back to compile-time default CONFIG_WIFI_ON_BOOT (default y).
+ */
+#if defined(CONFIG_WHC_HOST) || defined(CONFIG_WHC_NONE)
+static int wifi_auto_on_boot_enabled(void)
+{
+	uint8_t v = 0;
+	if (rt_kv_get("wifi_on_boot", &v, 1) == 1) {
+		return (v != 0);
+	}
+#ifdef CONFIG_WIFI_ON_BOOT
+	return 1;
+#else
+	return 0;
+#endif
+}
+#endif
+
 /**********************************************************************************************
  *                                WHC host performs wifi init
  *********************************************************************************************/
@@ -68,10 +94,13 @@ void wifi_init_thread(void *param)
 
 	whc_host_init();
 
-#ifdef CONFIG_WHC_WIFI_API_PATH
-	wifi_on(RTW_MODE_STA);
-
-	RTK_LOGS(TAG_WLAN_DRV, RTK_LOG_INFO, "Available heap after wifi init %d\n", rtos_mem_get_free_heap_size() + WIFI_STACK_SIZE_INIT);
+#if defined(CONFIG_WHC_WIFI_API_PATH)
+	if (wifi_auto_on_boot_enabled()) {
+		wifi_on(RTW_MODE_STA);
+		RTK_LOGS(TAG_WLAN_DRV, RTK_LOG_INFO, "Available heap after wifi init %d\n", rtos_mem_get_free_heap_size() + WIFI_STACK_SIZE_INIT);
+	} else {
+		RTK_LOGS(TAG_WLAN_DRV, RTK_LOG_WARN, "Wi-Fi boot policy: off (skip wifi_on); enable later via AT command\n");
+	}
 #endif
 
 	rtos_task_delete(NULL);
@@ -111,9 +140,12 @@ void wifi_init_thread(void *param)
 	LwIP_Init();
 #endif
 
-	wifi_on(RTW_MODE_STA);
-
-	RTK_LOGS(TAG_WLAN_DRV, RTK_LOG_INFO, "Available heap after wifi init %d\n", rtos_mem_get_free_heap_size() + WIFI_STACK_SIZE_INIT);
+	if (wifi_auto_on_boot_enabled()) {
+		wifi_on(RTW_MODE_STA);
+		RTK_LOGS(TAG_WLAN_DRV, RTK_LOG_INFO, "Available heap after wifi init %d\n", rtos_mem_get_free_heap_size() + WIFI_STACK_SIZE_INIT);
+	} else {
+		RTK_LOGS(TAG_WLAN_DRV, RTK_LOG_WARN, "Wi-Fi boot policy: off (skip wifi_on); enable later via AT command\n");
+	}
 
 	/* Kill init thread after all init tasks done */
 	rtos_task_delete(NULL);

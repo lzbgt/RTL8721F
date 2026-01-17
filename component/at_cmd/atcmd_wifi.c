@@ -1586,6 +1586,110 @@ end:
 }
 #endif /* CONFIG_WLAN */
 
+#if defined(CONFIG_WLAN) && (defined(CONFIG_WHC_HOST) || defined(CONFIG_WHC_NONE))
+static void at_wlpwr_help(void)
+{
+	RTK_LOGI(NOTAG, "\r\n");
+	RTK_LOGI(NOTAG, "AT+WLPWR\r\n");
+	RTK_LOGI(NOTAG, "AT+WLPWR=<enable>[,<save_boot>]\r\n");
+	RTK_LOGI(NOTAG, "\t<enable>:\t0 stop STA/AP and suppress Wi-Fi activity, 1 call wifi_on(STA)\r\n");
+	RTK_LOGI(NOTAG, "\t<save_boot>:\t0 no save, 1 persist boot policy (wifi_on_boot KV)\r\n");
+}
+
+static int wifi_boot_policy_get(int *out_enabled)
+{
+	uint8_t v = 0;
+	if (rt_kv_get("wifi_on_boot", &v, 1) == 1) {
+		*out_enabled = (v != 0);
+		return 1; /* from KV */
+	}
+#ifdef CONFIG_WIFI_ON_BOOT
+	*out_enabled = 1;
+#else
+	*out_enabled = 0;
+#endif
+	return 0; /* from default */
+}
+
+static void wifi_boot_policy_set(int enabled)
+{
+	uint8_t v = enabled ? 1 : 0;
+	(void)rt_kv_set("wifi_on_boot", &v, 1);
+}
+
+void at_wlpwr(void *arg)
+{
+	char *argv[MAX_ARGC] = {0};
+	int argc = 0;
+	int error_no = RTW_AT_OK;
+	int enable = -1;
+	int save_boot = 0;
+
+	at_printf("[+WLPWR]\r\n");
+
+	if (arg == NULL) {
+		int boot_en = 0;
+		const int from_kv = wifi_boot_policy_get(&boot_en);
+		at_printf("boot_auto_on=%d (source=%s)\r\n", boot_en, from_kv ? "kv" : "default");
+		at_printf("sta_running=%d ap_running=%d\r\n",
+				  (wifi_is_running(STA_WLAN_INDEX) ? 1 : 0),
+				  (wifi_is_running(SOFTAP_WLAN_INDEX) ? 1 : 0));
+		at_printf(ATCMD_OK_END_STR);
+		return;
+	}
+
+	argc = parse_param(arg, argv);
+	if (argc < 2 || argc > 3 || argv[1] == NULL || argv[1][0] == '\0') {
+		error_no = RTW_AT_ERR_PARAM_NUM_ERR;
+		goto end;
+	}
+	enable = atoi(argv[1]);
+	if (!(enable == 0 || enable == 1)) {
+		error_no = RTW_AT_ERR_INVALID_PARAM_VALUE;
+		goto end;
+	}
+	if (argc == 3) {
+		save_boot = atoi(argv[2]);
+		if (!(save_boot == 0 || save_boot == 1)) {
+			error_no = RTW_AT_ERR_INVALID_PARAM_VALUE;
+			goto end;
+		}
+	}
+
+	if (enable) {
+		if (!wifi_is_running(STA_WLAN_INDEX)) {
+			if (wifi_on(RTW_MODE_STA) != RTK_SUCCESS) {
+				error_no = RTW_AT_ERR_UNKNOWN_ERR;
+				goto end;
+			}
+		}
+		at_printf("wifi_on: ok\r\n");
+	} else {
+		/* Best-effort "off": stop AP, disconnect STA, stop reconnect logic. */
+		(void)wifi_set_autoreconnect(0);
+		(void)wifi_disconnect();
+		if (wifi_is_running(SOFTAP_WLAN_INDEX)) {
+			(void)wifi_stop_ap();
+		}
+		(void)wifi_set_ips_internal(1);
+		at_printf("wifi: disconnected/stopped (no hard power-off API)\r\n");
+	}
+
+	if (save_boot) {
+		wifi_boot_policy_set(enable);
+		at_printf("boot_auto_on saved: %d (key=wifi_on_boot)\r\n", enable);
+	}
+
+end:
+	if (error_no == RTW_AT_OK) {
+		at_printf(ATCMD_OK_END_STR);
+	} else {
+		at_wlpwr_help();
+		at_printf(ATCMD_ERROR_END_STR, error_no);
+	}
+}
+#endif
+
 #ifdef CONFIG_LWIP_LAYER
 static void at_wlstaticip_help(void)
 {
@@ -1807,6 +1911,7 @@ log_item_t at_wifi_items[ ] = {
 	{"+WLSTATICIP", at_wlstaticip, {NULL, NULL}},
 #endif /* CONFIG_LWIP_LAYER */
 #ifdef CONFIG_WLAN
+	{"+WLPWR", at_wlpwr, {NULL, NULL}},
 	{"+WLCONN", at_wlconn, {NULL, NULL}},
 	{"+WLDISCONN", at_wldisconn, {NULL, NULL}},
 	{"+WLSCAN", at_wlscan, {NULL, NULL}},

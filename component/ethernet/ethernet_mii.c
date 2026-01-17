@@ -19,6 +19,10 @@ volatile u32 g_rmii_tx_call = 0;
 volatile u32 g_rmii_tx_submit = 0;
 volatile u32 g_rmii_tx_getbuf_null = 0;
 
+/* Optional override of MDC/MDIO pins (board-dependent). 0xFF means "use ETHERNET_PAD table". */
+u8 g_eth_mdc_pin = 0xFF;
+u8 g_eth_mdio_pin = 0xFF;
+
 #define ETH_TXDONE              EthTxDone
 #define ETH_RXDONE              EthRxDone
 #define ETH_LINKUP              EthLinkUp
@@ -353,10 +357,12 @@ void ethernet_pin_config(void)
 		Pinmux_Config(ETHERNET_PAD[ETHERNET_Pin_Grp][pinid], PINMUX_FUNCTION_RMII);
 	}
 
-	Pinmux_Config(ETHERNET_PAD[ETHERNET_Pin_Grp][8], PINMUX_FUNCTION_RMII_MDC);
-	Pinmux_Config(ETHERNET_PAD[ETHERNET_Pin_Grp][9], PINMUX_FUNCTION_RMII_MDIO);
+	const u8 mdc_pin = (g_eth_mdc_pin != 0xFF) ? g_eth_mdc_pin : ETHERNET_PAD[ETHERNET_Pin_Grp][8];
+	const u8 mdio_pin = (g_eth_mdio_pin != 0xFF) ? g_eth_mdio_pin : ETHERNET_PAD[ETHERNET_Pin_Grp][9];
+	Pinmux_Config(mdc_pin, PINMUX_FUNCTION_RMII_MDC);
+	Pinmux_Config(mdio_pin, PINMUX_FUNCTION_RMII_MDIO);
 	/* MDIO is open-drain; ensure it isn't stuck-low if the board lacks an external pull-up. */
-	PAD_PullCtrl(ETHERNET_PAD[ETHERNET_Pin_Grp][9], GPIO_PuPd_UP);
+	PAD_PullCtrl(mdio_pin, GPIO_PuPd_UP);
 
 #ifndef CONFIG_PHY_INT_XTAL
 	Pinmux_Config(ETHERNET_PAD[ETHERNET_Pin_Grp][10], PINMUX_FUNCTION_EXT_CLK_OUT);
@@ -375,6 +381,7 @@ void ethernet_pin_config(void)
 #endif
 #endif
 }
+
 
 void ethernet_clock_set(void)
 {
